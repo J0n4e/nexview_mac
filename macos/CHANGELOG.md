@@ -2,7 +2,7 @@
 
 What changed in each version of Nexview for Mac. The release on GitHub and the update window show the section for that version.
 
-## Unreleased
+## 0.1.4
 
 ### Changed
 - Touch ID sign-in and saved passwords removed; you sign in through the page as before, and the session usually keeps you signed in. Saved passwords are deleted on first launch. Servers and keys now live in the macOS Keychain.
@@ -11,11 +11,15 @@ What changed in each version of Nexview for Mac. The release on GitHub and the u
 - Each update is logged to `~/Library/Logs/Nexview/update.log`.
 - The update window shows a progress bar while downloading, and its buttons are disabled during the install. Errors appear in the window.
 - **Check for Updates** tells you when GitHub is rate-limiting checks, separately from being offline.
+- Servers that can't be reached are checked less often, until they respond again.
 
 ### Fixed
 - Editing a server's address keeps its read-only key, queued mark-reads and notification state when only the scheme or port changed (same host); a different host counts as a different server, so the old key is deleted there (when possible) and forgotten instead of being sent to the new one.
 - The same server can no longer be added twice under a different spelling (case, default port, trailing slash); Settings and the add-server dialog say which server already uses the address. Existing duplicates are merged at launch.
 - Signing out in the page, switching accounts, removing a server and **Sign out everywhere** now delete the app's read-only key on the server instead of only forgetting it on this Mac. If the server can't be reached, the key is deleted the next time that account signs in here.
+
+### Build
+- Code reorganised into smaller files.
 
 ## 0.1.3
 

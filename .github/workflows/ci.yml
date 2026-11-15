@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, development]
 
 permissions:
   contents: read
@@ -25,9 +25,23 @@ jobs:
           [ ${#tests[@]} -gt 0 ] || { echo "no tests found"; exit 1; }
           for t in "${tests[@]}"; do
             echo "==> $t"
-            swiftc -parse-as-library macos/Updater.swift macos/ServerURL.swift "$t" -o "$RUNNER_TEMP/test-bin"
+            swiftc -parse-as-library macos/Updater.swift macos/ServerURL.swift macos/Backoff.swift "$t" -o "$RUNNER_TEMP/test-bin"
             "$RUNNER_TEMP/test-bin"
           done
 
       - name: Build
         run: zsh macos/build.sh
+
+      - name: Package test build
+        run: |
+          set -euo pipefail
+          V="$(tr -d '[:space:]' < macos/VERSION)-dev.$(git rev-parse --short HEAD)"
+          echo "TEST_ZIP=Nexview-$V.zip" >> "$GITHUB_ENV"
+          ditto -c -k --keepParent build/Nexview.app "Nexview-$V.zip"
+
+      - name: Upload test build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nexview-test-build
+          path: ${{ env.TEST_ZIP }}
+          retention-days: 14

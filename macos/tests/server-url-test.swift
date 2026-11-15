@@ -1,4 +1,4 @@
-// Run: swiftc -parse-as-library macos/Updater.swift macos/ServerURL.swift macos/tests/server-url-test.swift -o /tmp/st && /tmp/st
+// Run: swiftc -parse-as-library macos/Updater.swift macos/ServerURL.swift macos/Backoff.swift macos/tests/server-url-test.swift -o /tmp/st && /tmp/st
 import Foundation
 
 func check(_ ok: Bool, _ what: String) { if !ok { print("FAIL: \(what)"); exit(1) } }
