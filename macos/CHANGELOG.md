@@ -6,6 +6,11 @@ What changed in each version of Nexview for Mac. The release on GitHub and the u
 
 ### Changed
 - Touch ID sign-in and saved passwords removed; you sign in through the page as before, and the session usually keeps you signed in. Saved passwords are deleted on first launch. Servers and keys now live in the macOS Keychain.
+- Right before replacing the app, the installer checks the new copy's code signature, bundle ID and version again; if anything is off, the old app is kept and reopened.
+- The previous app is kept as a backup until the new one opens; if it fails to open, the previous app is put back and reopened.
+- Each update is logged to `~/Library/Logs/Nexview/update.log`.
+- The update window shows a progress bar while downloading, and its buttons are disabled during the install. Errors appear in the window.
+- **Check for Updates** tells you when GitHub is rate-limiting checks, separately from being offline.
 
 ## 0.1.3
 

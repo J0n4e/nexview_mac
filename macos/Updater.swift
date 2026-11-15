@@ -21,6 +21,10 @@ final class Updater: NSObject {
     var timer: Timer?
     var window: NSWindow?
     var installing = false
+    var installButtons: [NSButton] = []
+    var progressBar: NSProgressIndicator?
+    var statusLabel: NSTextField?
+    var progressObservation: NSKeyValueObservation?
     /// Set by the app: whether its main window is on screen, so a found update can open its window right away.
     var mainWindowVisible: () -> Bool = { false }
 
@@ -58,10 +62,36 @@ final class Updater: NSObject {
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.cachePolicy = .reloadIgnoringLocalCacheData
         req.timeoutInterval = 20
-        URLSession.shared.dataTask(with: req) { data, resp, _ in
-            let release = (resp as? HTTPURLResponse)?.statusCode == 200 ? data.flatMap(Self.parse) : nil
-            DispatchQueue.main.async { self.found(release, reached: data != nil && (resp as? HTTPURLResponse)?.statusCode == 200, manual: manual) }
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            let http = resp as? HTTPURLResponse
+            let status = Self.classifyCheck(statusCode: http?.statusCode,
+                                            rateLimitRemaining: http?.value(forHTTPHeaderField: "X-RateLimit-Remaining"),
+                                            transportFailed: err != nil || data == nil)
+            let release = status == .ok ? data.flatMap(Self.parse) : nil
+            DispatchQueue.main.async { self.found(release, status: status, manual: manual) }
         }.resume()
+    }
+
+    /// Why a release check did or didn't get an answer from GitHub.
+    enum CheckStatus: Equatable { case ok, rateLimited, offline, serverError(Int) }
+
+    /// Pure classification of a check response, so a GitHub rate limit isn't reported as being offline.
+    static func classifyCheck(statusCode: Int?, rateLimitRemaining: String?, transportFailed: Bool) -> CheckStatus {
+        guard let code = statusCode, code > 0 else { return .offline }
+        if transportFailed && code == 200 { return .offline }
+        if code == 200 { return .ok }
+        if code == 429 { return .rateLimited }
+        if code == 403, rateLimitRemaining?.trimmingCharacters(in: .whitespaces) == "0" { return .rateLimited }
+        return .serverError(code)
+    }
+
+    static func checkFailureText(_ s: CheckStatus) -> String {
+        switch s {
+        case .ok: return ""
+        case .rateLimited: return "GitHub is limiting how often updates can be checked from your network. Try again in an hour."
+        case .offline: return "GitHub could not be reached. Check your internet connection and try again."
+        case .serverError(let c): return "GitHub answered with an error (HTTP \(c)). Try again later."
+        }
     }
 
     static func parse(_ data: Data) -> Release? {
@@ -87,7 +117,8 @@ final class Updater: NSObject {
         return key.isValidSignature(sig, for: data)
     }
 
-    func found(_ release: Release?, reached: Bool, manual: Bool) {
+    func found(_ release: Release?, status: CheckStatus, manual: Bool) {
+        let reached = status == .ok
         if installing { return }
         if let r = release, Self.isNewer(r.version, than: current), r.zip == nil || r.sig == nil {
             if manual { alert("Could not check for updates.",
@@ -96,7 +127,7 @@ final class Updater: NSObject {
         }
         guard let r = release, Self.isNewer(r.version, than: current) else {
             if manual { alert(reached ? "You're up to date." : "Could not check for updates.",
-                              reached ? "Nexview for Mac \(current) is the newest version." : "GitHub could not be reached. Try again later.") }
+                              reached ? "Nexview for Mac \(current) is the newest version." : Self.checkFailureText(status)) }
             return
         }
         if !manual && r.version == skipped { return }
@@ -150,7 +181,17 @@ final class Updater: NSObject {
         icon.widthAnchor.constraint(equalToConstant: 56).isActive = true
         icon.heightAnchor.constraint(equalToConstant: 56).isActive = true
         let buttons = NSStackView(views: [skip, NSView(), later, install])
-        let all = NSStackView(views: [top, scroll, buttons])
+        installButtons = [install, later, skip]
+        let bar = NSProgressIndicator()
+        bar.style = .bar
+        bar.isIndeterminate = true
+        bar.minValue = 0; bar.maxValue = 1
+        bar.isHidden = true
+        let status = NSTextField(wrappingLabelWithString: "")
+        status.textColor = .secondaryLabelColor
+        status.isHidden = true
+        progressBar = bar; statusLabel = status
+        let all = NSStackView(views: [top, scroll, bar, status, buttons])
         all.orientation = .vertical; all.alignment = .leading; all.spacing = 12
         all.edgeInsets = NSEdgeInsets(top: 16, left: 20, bottom: 16, right: 20)
         all.translatesAutoresizingMaskIntoConstraints = false
@@ -163,6 +204,8 @@ final class Updater: NSObject {
             all.bottomAnchor.constraint(equalTo: w.contentView!.bottomAnchor),
             scroll.widthAnchor.constraint(equalTo: all.widthAnchor, constant: -40),
             buttons.widthAnchor.constraint(equalTo: scroll.widthAnchor),
+            bar.widthAnchor.constraint(equalTo: scroll.widthAnchor),
+            status.widthAnchor.constraint(equalTo: scroll.widthAnchor),
             scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 200),
         ])
         window = w
@@ -213,27 +256,23 @@ final class Updater: NSObject {
         guard let zipURL = r.zip, let sigURL = r.sig else {
             alert("Could not install the update.", "This release has no signed download."); return
         }
-        installing = true
         let target = Bundle.main.bundleURL
         guard FileManager.default.isWritableFile(atPath: target.deletingLastPathComponent().path) else {
-            installing = false
-            alert("Could not install the update.", "Nexview can't write to \(target.deletingLastPathComponent().path).")
+            installFailed("Nexview can't write to \(target.deletingLastPathComponent().path).")
             return
         }
+        setInstalling(true, status: "Downloading \(r.version)…")
         window?.title = "Downloading \(r.version)…"
         let fail: (Error) -> Void = { e in
-            DispatchQueue.main.async {
-                self.installing = false
-                self.window?.title = "Software Update"
-                self.alert("Could not install the update.", (e as? UpdateError)?.text ?? e.localizedDescription)
-            }
+            DispatchQueue.main.async { self.installFailed((e as? UpdateError)?.text ?? e.localizedDescription) }
         }
         URLSession.shared.dataTask(with: sigURL) { sigData, sigResp, sigErr in
             guard let sigData, (sigResp as? HTTPURLResponse)?.statusCode == 200,
                   let sigText = String(data: sigData, encoding: .utf8) else {
                 return fail(UpdateError(sigErr?.localizedDescription ?? "The update's signature could not be downloaded."))
             }
-            URLSession.shared.downloadTask(with: zipURL) { file, resp, err in
+            let task = URLSession.shared.downloadTask(with: zipURL) { file, resp, err in
+                DispatchQueue.main.async { self.progressObservation = nil }
                 guard let file, (resp as? HTTPURLResponse)?.statusCode == 200 else {
                     return fail(UpdateError(err?.localizedDescription ?? "The download failed."))
                 }
@@ -248,6 +287,11 @@ final class Updater: NSObject {
                     return fail(error)
                 }
                 // Verification and unpacking run off the main thread; only UI hops back.
+                DispatchQueue.main.async {
+                    self.progressBar?.isIndeterminate = true
+                    self.progressBar?.startAnimation(nil)
+                    self.statusLabel?.stringValue = "Verifying \(r.version)…"
+                }
                 DispatchQueue.global(qos: .userInitiated).async {
                     do {
                         let app = try self.verifyAndUnpack(zip, signature: sigText, into: dir, expecting: r.version)
@@ -257,8 +301,54 @@ final class Updater: NSObject {
                         fail(error)
                     }
                 }
-            }.resume()
+            }
+            DispatchQueue.main.async { self.observeProgress(of: task) }
+            task.resume()
         }.resume()
+    }
+
+    /// Determinate once the server's Content-Length is known, indeterminate until then.
+    func observeProgress(of task: URLSessionDownloadTask) {
+        progressObservation = task.progress.observe(\.fractionCompleted, options: [.initial, .new]) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                guard let self, let bar = self.progressBar, self.installing else { return }
+                let expected = task.countOfBytesExpectedToReceive
+                if expected > 0 {
+                    if bar.isIndeterminate { bar.stopAnimation(nil); bar.isIndeterminate = false }
+                    bar.doubleValue = Double(task.countOfBytesReceived) / Double(expected)
+                    self.statusLabel?.stringValue = "Downloading… " + ByteCountFormatter.string(fromByteCount: task.countOfBytesReceived, countStyle: .file)
+                        + " of " + ByteCountFormatter.string(fromByteCount: expected, countStyle: .file)
+                }
+            }
+        }
+    }
+
+    /// Shows or hides the progress UI and locks the window's buttons while an install is running.
+    func setInstalling(_ on: Bool, status: String) {
+        installing = on
+        installButtons.forEach { $0.isEnabled = !on }
+        if let bar = progressBar {
+            bar.isHidden = !on
+            bar.isIndeterminate = true
+            if on { bar.startAnimation(nil) } else { bar.stopAnimation(nil) }
+        }
+        statusLabel?.stringValue = status
+        statusLabel?.textColor = .secondaryLabelColor
+        statusLabel?.isHidden = status.isEmpty
+    }
+
+    /// Unlocks the window and shows the error in it (or in an alert if the window is gone).
+    func installFailed(_ text: String) {
+        progressObservation = nil
+        setInstalling(false, status: "")
+        window?.title = "Software Update"
+        if let label = statusLabel, let w = window, w.isVisible {
+            label.stringValue = "Could not install the update. " + text
+            label.textColor = .systemRed
+            label.isHidden = false
+        } else {
+            alert("Could not install the update.", text)
+        }
     }
 
     struct UpdateError: Error { let text: String; init(_ t: String) { text = t } }
@@ -285,23 +375,60 @@ final class Updater: NSObject {
         return app
     }
 
-    /// The running app can't replace itself, so a short script waits for it to quit, swaps the bundle and reopens it.
+    static var updateLogURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Nexview/update.log")
+    }
+
+    /// Runs under `zsh -c` after the app quits. Everything comes in as positional arguments, never interpolated:
+    /// $1 new app, $2 installed app, $3 temp dir, $4 expected bundle id, $5 expected version, $6 log file, $7 app pid.
+    /// It re-checks the new bundle right before the swap, keeps the old bundle at "$2.old" until the new one
+    /// has opened, and puts the old one back and reopens it if anything fails.
+    static let swapScript = """
+    new="$1"; target="$2"; tmp="$3"; want_id="$4"; want_ver="$5"; log="$6"; pid="$7"
+    backup="$target.old"
+    /bin/mkdir -p "$(/usr/bin/dirname "$log")"
+    if [ -f "$log" ] && [ "$(/usr/bin/stat -f %z "$log" 2>/dev/null || echo 0)" -gt 262144 ]; then /bin/mv -f "$log" "$log.1"; fi
+    say() { print -r -- "$(/bin/date '+%Y-%m-%d %H:%M:%S') $*" >> "$log" }
+    abort() { say "ABORT: $*; keeping the installed app"; /bin/rm -rf "$tmp"; /usr/bin/open "$target"; exit 1 }
+    say "update to $want_ver: waiting for pid $pid to quit"
+    while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
+    /usr/bin/codesign --verify --deep --strict "$new" >> "$log" 2>&1 || abort "codesign verification of the new app failed"
+    got_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$new/Contents/Info.plist" 2>/dev/null)"
+    [ "$got_id" = "$want_id" ] || abort "bundle id is '$got_id', expected '$want_id'"
+    got_ver="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$new/Contents/Info.plist" 2>/dev/null)"
+    [ "$got_ver" = "$want_ver" ] || abort "version is '$got_ver', expected '$want_ver'"
+    say "new app verified"
+    /bin/rm -rf "$backup"
+    /bin/mv "$target" "$backup" || abort "could not move the installed app aside"
+    if ! /bin/mv "$new" "$target"; then
+      /bin/mv "$backup" "$target"
+      abort "could not move the new app into place"
+    fi
+    if /usr/bin/open "$target"; then
+      say "opened $want_ver; removing the backup"
+      /bin/rm -rf "$backup"
+    else
+      say "the new app failed to open; restoring the previous one"
+      /bin/rm -rf "$target"
+      /bin/mv "$backup" "$target" && /usr/bin/open "$target"
+    fi
+    /bin/rm -rf "$tmp"
+    say "done"
+    """
+
+    static func swapArguments(app: String, target: String, dir: String, version: String, log: String, pid: Int32) -> [String] {
+        ["-c", swapScript, "nexview-update", app, target, dir, bundleID, version, log, String(pid)]
+    }
+
+    /// The running app can't replace itself, so a short script waits for it to quit, re-verifies and swaps the bundle and reopens it.
     func swap(in app: URL, for target: URL, cleaning dir: URL) {
-        let script = """
-        while kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do sleep 0.2; done
-        old="$2.old-$$"
-        mv "$2" "$old" && { mv "$1" "$2" && rm -rf "$old" || mv "$old" "$2"; }
-        open "$2"
-        rm -rf "$3"
-        """
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-c", script, "nexview-update", app.path, target.path, dir.path]
+        p.arguments = Self.swapArguments(app: app.path, target: target.path, dir: dir.path, version: pending?.version ?? "",
+                                         log: Self.updateLogURL.path, pid: ProcessInfo.processInfo.processIdentifier)
         do { try p.run() } catch {
             try? FileManager.default.removeItem(at: dir)
-            installing = false
-            window?.title = "Software Update"
-            alert("Could not install the update.", error.localizedDescription); return
+            installFailed(error.localizedDescription); return
         }
         NSApp.terminate(nil)
     }
