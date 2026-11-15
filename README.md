@@ -2,7 +2,7 @@
 
 A native macOS app for [Nexview](https://github.com/DerKezorm/nexview), the self-hosted media
 discovery dashboard by DerKezorm. It connects to your own Nexview server and shows it in a proper
-Mac window, with native notifications, a menu bar icon and Touch ID sign-in.
+Mac window, with native notifications, and a menu bar icon.
 
 Apple Silicon only, macOS 14 Sonoma or newer.
 
@@ -23,14 +23,12 @@ Around it, the app adds:
   access key, so notifications arrive even with the window closed. Clearing a notification in
   macOS marks it read in Nexview, and reading it in Nexview removes it from Notification Center.
 - **Dock and menu bar badge**: unread notifications plus requests waiting for your approval.
-- **Touch ID sign-in**: sign in once and let Touch ID fill in your password afterwards.
 - **Run in background**: closing the window leaves only the menu bar icon; click it to bring
   Nexview back. ⌘Q quits completely.
 - **Open at login**.
 
-Server addresses, saved sign-ins and access keys are encrypted with a key held in the Mac's
-Secure Enclave and stored in `~/Library/Application Support/Nexview for Mac/`. They never leave
-the Mac.
+Server addresses and the app's read-only access keys are kept in the macOS Keychain on this Mac.
+The app never sees or stores your password: you sign in through the Nexview page itself.
 
 ## Install
 
