@@ -2,7 +2,7 @@
 
 What changed in each version of Nexview for Mac. The release on GitHub and the update window show the section for that version.
 
-## Unreleased
+## 0.1.4
 
 ### Changed
 - Touch ID sign-in and saved passwords removed; you sign in through the page as before, and the session usually keeps you signed in. Saved passwords are deleted on first launch. Servers and keys now live in the macOS Keychain.
