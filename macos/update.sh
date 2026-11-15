@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Syncs the upstream checkout to the commit pinned in macos/UPSTREAM_REF and rebuilds build/Nexview.app.
 # To move to a newer upstream, update macos/UPSTREAM_REF (git pull this repo) and run this again.
-# New features need no rebuild: they arrive when you update the container on Unraid.
+# New features need no rebuild: they arrive when you update your Nexview server.
 set -euo pipefail
 ROOT="${0:A:h:h}"
 REF=$(LC_ALL=C tr -cd '0-9a-f' < "$ROOT/macos/UPSTREAM_REF")

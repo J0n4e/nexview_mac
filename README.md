@@ -2,7 +2,7 @@
 
 A native macOS app for [Nexview](https://github.com/DerKezorm/nexview), the self-hosted media
 discovery dashboard by DerKezorm. It connects to your own Nexview server and shows it in a proper
-Mac window, with native notifications, and a menu bar icon.
+Mac window, with native notifications, a menu bar icon and automatic updates.
 
 Apple Silicon only, macOS 14 Sonoma or newer.
 
@@ -26,36 +26,121 @@ Around it, the app adds:
 - **Run in background**: closing the window leaves only the menu bar icon; click it to bring
   Nexview back. ⌘Q quits completely.
 - **Open at login**.
-
-Server addresses and the app's read-only access keys are kept in the macOS Keychain on this Mac.
-The app never sees or stores your password: you sign in through the Nexview page itself.
+- **Automatic updates** (see below).
 
 ## Install
 
-Download the latest `Nexview-<version>.zip` from
-[Releases](https://github.com/J0n4e/nexview_mac/releases), unzip it and move **Nexview** to
-Applications. The app is signed ad hoc, so the first time you open it, right-click it and choose
-**Open**. Then enter the address of your Nexview server and sign in.
+1. Download the latest `Nexview-<version>.zip` from
+   [Releases](https://github.com/J0n4e/nexview_mac/releases).
+2. Unzip it and move **Nexview** to Applications.
+3. The app is signed ad hoc (not with an Apple Developer ID), so the first time you open it,
+   right-click it in Finder, choose **Open** and confirm. After that it opens normally.
+4. Enter the address of your Nexview server and sign in with your Nexview account.
 
-## Build
+## Updates
 
-Requirements: an Apple Silicon Mac with the Xcode command line tools (`xcode-select --install`).
+Nexview for Mac looks for a new version 10 seconds after launch and then every 6 hours. You can
+also check yourself with **Nexview → Check for Updates…**. When a new version is out, you see
+what changed and can install it, skip that version or be reminded later. If the window is
+closed, you get a notification instead.
+
+Every release is signed with an Ed25519 key. The app only downloads updates from this
+repository's [Releases](https://github.com/J0n4e/nexview_mac/releases) and checks the signature
+before installing anything. It also checks that the download really is a newer Nexview for Mac
+with an intact code signature.
+
+If any of these checks fails, nothing is installed: you see a message saying why and keep your
+current version. You can always install a release by hand as described under *Install*.
+
+## Signing in
+
+You sign in through Nexview's own sign-in page, just like in a browser. The session keeps you
+signed in, so you don't have to sign in every time you open the app. Nexview for Mac doesn't
+store your password.
+
+Your servers and the read-only access keys used for notifications are stored in the macOS
+Keychain. They never leave the Mac.
+
+## Security notes
+
+- Use an `https://` address for your server whenever you can.
+- If you enter a plain `http://` address for a server that is not on this Mac or your local
+  network, the app warns you: your password and session would travel unencrypted.
+- The notification keys are read-only: they can read your notifications but not change anything
+  on your server.
+
+## Building from source
+
+Requirements: an Apple Silicon Mac with macOS 14 or newer and the Xcode command line tools
+(`xcode-select --install`).
 
 ```sh
 zsh macos/build.sh
 ```
 
-This fetches Nexview's code into `src/` on the first run (only its icon and version are used)
-and builds `build/Nexview.app`. Copy it to `/Applications` to install it.
+This fetches Nexview's code into `src/` (only its icon and version are used) and builds
+`build/Nexview.app`. Copy it to `/Applications` to install it. The first time you open it,
+right-click it and choose **Open**, as above.
+
+The upstream Nexview code is pinned to the commit in `macos/UPSTREAM_REF` (a full 40-character
+commit SHA). To move to a newer upstream, put the new commit SHA in that file and run:
 
 ```sh
 zsh macos/update.sh
 ```
 
-pulls the latest Nexview and rebuilds.
+It checks out the pinned commit, lists what changed upstream and rebuilds. Add `--force` to
+rebuild even when nothing changed.
 
-The app is signed ad hoc, so the first time you open it on a Mac, right-click it and choose
-**Open**.
+To run the tests the way CI does:
+
+```sh
+for t in macos/tests/*-test.swift; do
+  swiftc -parse-as-library macos/Updater.swift "$t" -o /tmp/nexview-test && /tmp/nexview-test
+done
+```
+
+## Compatible Nexview server
+
+The app is built and tested against the upstream Nexview commit in `macos/UPSTREAM_REF`
+(currently `ee0242fd378dc4e2b77debc0f86bc1ac04085e7a`); use that version of Nexview or newer.
+Besides the normal web interface, the app uses these server endpoints:
+
+- `GET /api/health`: checking a server address
+- `POST /api/auth/refresh`, `GET /api/auth/me`: the session
+- `GET` and `POST /api/auth/me/schluessel`, `DELETE /api/auth/me/schluessel/<id>`: the
+  read-only notification keys
+- `POST /api/notifications/<id>/read`: marking notifications read
+
+## Releasing (maintainers)
+
+1. Bump the version in `macos/VERSION`.
+2. Add a `## <version>` section with exactly that version to `macos/CHANGELOG.md`. It becomes
+   the release notes.
+3. Open a pull request, wait for CI to be green, then merge it.
+
+On `main`, the Release workflow notices a version that has not been released yet. It runs the
+tests, builds the app, signs the zip with the `NEXVIEW_UPDATE_SIGNING_KEY` secret and publishes
+`Nexview-<version>.zip` and `Nexview-<version>.zip.sig` as release `v<version>`.
+
+To verify a release by hand (needs OpenSSL 3; the `openssl` that ships with macOS is LibreSSL,
+so use `brew install openssl@3`):
+
+```sh
+V=0.1.3
+curl -LO https://github.com/J0n4e/nexview_mac/releases/download/v$V/Nexview-$V.zip
+curl -LO https://github.com/J0n4e/nexview_mac/releases/download/v$V/Nexview-$V.zip.sig
+
+# The app's raw public key behind the Ed25519 DER prefix 302a300506032b6570032100, as PEM.
+{ printf '\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00'
+  printf 'QZNsnKHonvP62BxLWUxBUfej1aqt65ao2TeYBEeZNKk=' | base64 -d
+} | openssl pkey -pubin -inform DER -out pub.pem
+
+base64 -d < Nexview-$V.zip.sig > sig.bin
+openssl pkeyutl -verify -pubin -inkey pub.pem -rawin -in Nexview-$V.zip -sigfile sig.bin
+```
+
+A genuine release prints `Signature Verified Successfully`.
 
 ## Notes
 
