@@ -30,20 +30,20 @@
 **Files:** Create `macos/Updater.swift`; Test `macos/tests/version-test.swift`
 **Produces:** `Updater.isNewer(_ candidate: String, than current: String) -> Bool`
 
-- [ ] Write `version-test.swift` asserting: `isNewer("0.1.10", than: "0.1.9")`, `isNewer("v0.2", than: "0.1.9")`, `!isNewer("0.1.1", than: "0.1.1")`, `!isNewer("0.1.0", than: "0.1.1")`, `!isNewer("junk", than: "0.1.1")`.
-- [ ] Run `swiftc macos/Updater.swift macos/tests/version-test.swift -o /tmp/vt && /tmp/vt`; expect failure, then implement, expect `ok`.
+- [x] Write `version-test.swift` asserting: `isNewer("0.1.10", than: "0.1.9")`, `isNewer("v0.2", than: "0.1.9")`, `!isNewer("0.1.1", than: "0.1.1")`, `!isNewer("0.1.0", than: "0.1.1")`, `!isNewer("junk", than: "0.1.1")`.
+- [x] Run `swiftc macos/Updater.swift macos/tests/version-test.swift -o /tmp/vt && /tmp/vt`; expect failure, then implement, expect `ok`.
 
 ### Task 2: Check, window, install
 **Files:** Modify `macos/Updater.swift`, `macos/main.swift` (menus, launch, notification response), `macos/build.sh` (compile Updater.swift)
 **Produces:** `Updater.shared.start()`, `@objc Updater.shared.checkNow()`, notification userInfo key `"update"` handled by `Updater.shared.showPending()`.
 
-- [ ] `start()`: first check after 10 s, then a 6 h timer; automatic checks skip `SkippedUpdate` and stay silent on errors.
-- [ ] Window: title, "you have …" line, notes rendered as Markdown in a scrollable text view, three buttons. If the main window is not visible, post a notification (category `update`) instead; clicking it opens the window.
-- [ ] Install: download the zip, `ditto -x -k` into a temp folder, check bundle id and newer version via `Bundle(url:)`, remove quarantine (`xattr -dr com.apple.quarantine`), start a detached zsh script that waits for this PID, replaces `Bundle.main.bundleURL`, and reopens it; then quit. Failures show an alert.
-- [ ] Build with `zsh macos/build.sh`; expect `==> Done`.
+- [x] `start()`: first check after 10 s, then a 6 h timer; automatic checks skip `SkippedUpdate` and stay silent on errors.
+- [x] Window: title, "you have …" line, notes rendered as Markdown in a scrollable text view, three buttons. If the main window is not visible, post a notification (category `update`) instead; clicking it opens the window.
+- [x] Install: download the zip, `ditto -x -k` into a temp folder, check bundle id and newer version via `Bundle(url:)`, remove quarantine (`xattr -dr com.apple.quarantine`), start a detached zsh script that waits for this PID, replaces `Bundle.main.bundleURL`, and reopens it; then quit. Failures show an alert.
+- [x] Build with `zsh macos/build.sh`; expect `==> Done`.
 
 ### Task 3: Release notes
 **Files:** Create `macos/CHANGELOG.md`; Modify `.github/workflows/release.yml`
-- [ ] CHANGELOG with sections `## 0.1.1` and `## 0.1.0`, plain-word lists.
-- [ ] Workflow: prepend the `## $VERSION` section's body (awk) to the existing install text.
-- [ ] Bump `macos/VERSION` to 0.1.2 and add its CHANGELOG entry when releasing.
+- [x] CHANGELOG with sections `## 0.1.1` and `## 0.1.0`, plain-word lists.
+- [x] Workflow: prepend the `## $VERSION` section's body (awk) to the existing install text.
+- [x] Bump `macos/VERSION` to 0.1.2 and add its CHANGELOG entry when releasing.
