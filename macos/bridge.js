@@ -1,0 +1,122 @@
+// Injected into the Nexview page. Two jobs:
+//  1. Give the native app its own read-only access key for this account, so the app can check
+//     notifications by itself, even with the window closed. The page's session token never
+//     leaves the page; only the read-only key is handed over.
+//  2. Touch ID sign-in.
+(() => {
+  if (window.__nexviewMac) return;
+  window.__nexviewMac = true;
+  const post = (m) => { try { window.webkit.messageHandlers.nexview.postMessage(m); } catch (e) {} };
+  let auth = null;
+  let apiBase = null;     // everything before "/api/", so a URL base path behind a proxy keeps working
+  let reported = false;
+
+  const origFetch = window.fetch;
+  window.fetch = async function (input, init) {
+    try {
+      const h = init && init.headers;
+      const a = h && (h.Authorization || (typeof h.get === 'function' && h.get('Authorization')));
+      if (a) auth = a;
+    } catch (e) {}
+    const res = await origFetch.apply(this, arguments);
+    try {
+      const url = typeof input === 'string' ? input : (input && input.url) || '';
+      const i = url.indexOf('/api/');
+      if (i >= 0 && apiBase === null) apiBase = url.slice(0, i);
+      if (/\/api\/auth\/logout/.test(url)) { auth = null; reported = false; post({ type: 'signedOut' }); }
+      else if (res.ok && /\/api\/notifications/.test(url)) post({ type: 'refresh' });  // read/cleared: update the badge now
+      else if (res.ok && auth && !reported) reportSession();
+      if (res.ok && auth) post({ type: 'alive' });
+    } catch (e) {}
+    return res;
+  };
+
+  const call = (path, opts) => origFetch((apiBase || '') + path, {
+    ...opts, credentials: 'include',
+    headers: { ...(opts.headers || {}), Authorization: auth, 'Content-Type': 'application/json' },
+  });
+  // With the window closed the page sleeps and its short-lived token can expire. Renew it the way
+  // Nexview's own client does (the refresh cookie), then try once more.
+  const api = async (path, opts = {}) => {
+    let r = await call(path, opts);
+    if (r.status === 401) {
+      const f = await origFetch((apiBase || '') + '/api/auth/refresh', { method: 'POST', credentials: 'same-origin' });
+      if (f.ok) { auth = 'Bearer ' + (await f.json()).access_token; r = await call(path, opts); }
+    }
+    return r;
+  };
+
+  async function reportSession() {
+    reported = true;
+    try {
+      const r = await api('/api/auth/me');
+      if (!r.ok) { reported = false; return; }
+      const me = await r.json();
+      post({ type: 'session', user: me.username });
+    } catch (e) { reported = false; }
+  }
+
+  // Called by the app when it has no key for this account yet.
+  window.__nexviewMacMakeKey = async (name) => {
+    if (!auth) return;
+    try {
+      const list = await api('/api/auth/me/schluessel');
+      if (list.ok) {
+        for (const k of await list.json()) {
+          if (k.name === name) await api('/api/auth/me/schluessel/' + k.id, { method: 'DELETE' });
+        }
+      }
+      const r = await api('/api/auth/me/schluessel', { method: 'POST', body: JSON.stringify({ name, nur_lesen: true }) });
+      if (!r.ok) return;
+      const k = await r.json();
+      const me = await (await api('/api/auth/me')).json();
+      post({ type: 'apikey', key: k.schluessel, id: k.id, user: me.username });
+    } catch (e) {}
+  };
+
+  // Called by the app when notifications were cleared in macOS: mark them read in Nexview.
+  window.__nexviewMacMarkRead = async (ids) => {
+    if (!auth) return;
+    const done = [];
+    for (const id of ids) {
+      try {
+        const r = await api('/api/notifications/' + id + '/read', { method: 'POST' });
+        if (r.ok || r.status === 404) done.push(id);      // 404: already gone, nothing left to do
+      } catch (e) {}
+    }
+    if (done.length) post({ type: 'marked', ids: done });
+  };
+
+  // --- Touch ID sign-in ---------------------------------------------------
+  let offered = false;
+  function loginForm() {
+    const pw = document.querySelector('input[type="password"][autocomplete="current-password"]');
+    return pw ? { pw, form: pw.form, user: pw.form && pw.form.querySelector('input[autocomplete="username"]') } : null;
+  }
+  function watchLogin() {
+    const f = loginForm();
+    if (!f || !f.form || !f.user) { offered = false; return; }
+    if (f.form.__nexviewMac) return;
+    f.form.__nexviewMac = true;
+    f.form.addEventListener('submit', () => {
+      const user = f.user.value, pass = f.pw.value;
+      if (!user || !pass) return;
+      setTimeout(() => { if (!loginForm()) post({ type: 'loggedIn', user, pass }); }, 2500);
+    }, true);
+    if (!offered) { offered = true; post({ type: 'loginForm' }); }
+  }
+  new MutationObserver(watchLogin).observe(document.documentElement, { childList: true, subtree: true });
+
+  const setValue = (el, v) => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+  window.__nexviewMacFill = (user, pass) => {
+    const f = loginForm();
+    if (!f) return false;
+    setValue(f.user, user); setValue(f.pw, pass);
+    f.form.__nexviewMacAuto = true;
+    setTimeout(() => f.form.requestSubmit(), 50);
+    return true;
+  };
+})();
