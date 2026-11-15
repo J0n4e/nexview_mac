@@ -1,0 +1,6 @@
+# Nexview itself, fetched by macos/build.sh
+src/
+# Build output and intermediates
+build/
+.cache/
+.DS_Store
