@@ -1,11 +1,12 @@
-// Server list and read-only keys in the macOS Keychain, loading at launch and the legacy vault migration.
+// Server list and read-only keys in a user-only file (store.json), loading at launch, and the one-time
+// migrations from the 0.1.4/0.1.5 Keychain item and the 0.1.3 Secure Enclave vault.
 import Foundation
 import SwiftUI   // MutableCollection.move(fromOffsets:toOffset:)
 import CryptoKit
 import Security
 import os
 
-// MARK: server list and read-only keys, kept in the macOS Keychain (never in plain-text prefs)
+// MARK: server list and read-only keys, kept in ~/Library/Application Support/Nexview for Mac/store.json (0600)
 
 let storeLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "io.github.derkezorm.nexview.macos", category: "store")
 
@@ -22,11 +23,12 @@ struct ServerStore: Codable {
         do { d = try JSONEncoder().encode(self) } catch {
             storeLog.error("Encoding the store failed: \(error.localizedDescription, privacy: .public)"); return
         }
-        guard !KeychainStore.writesBlocked else {
-            storeLog.error("Not saving: the Keychain item could not be read at launch and is left untouched"); return
+        guard !StoreFile.writesBlocked else {
+            storeLog.error("Not saving: the saved data could not be read at launch and is left untouched"); return
         }
-        let st = KeychainStore.write(d)
-        if st != errSecSuccess { storeLog.error("Saving the store to the Keychain failed: \(KeychainStore.describe(st), privacy: .public)") }
+        do { try FileStore.write(d, to: StoreFile.url) } catch {
+            storeLog.error("Saving the store file failed: \(String(describing: error), privacy: .public)")
+        }
     }
 
     /// Adds and selects a server. Refuses (returns false) an address another saved server already uses
@@ -81,16 +83,23 @@ struct ServerStore: Codable {
 /// A read-only Nexview access key the app made for itself, so it can check notifications on its own.
 struct AccessKey: Codable { var key: String; var id: Int; var user: String }
 
-// MARK: Keychain item
+// MARK: store file
 
-/// One generic-password item (service = bundle id, account "store") holding the JSON-encoded store.
-/// No biometry or user presence is required to read it. Uses the login keychain: the data-protection
-/// keychain needs a signed application identifier, which ad-hoc builds don't have.
-enum KeychainStore {
+enum StoreFile {
+    static var url: URL { FileStore.defaultFile }
+    /// Set when saved data exists but could not be read, so a save can't overwrite data we never saw.
+    static var writesBlocked = false
+}
+
+// MARK: legacy Keychain item (0.1.4 and 0.1.5): read once and delete, for the one-time migration only
+//
+// Those versions kept the store in a login-keychain generic password (service = bundle id, account
+// "store"). A self-signed app can't keep a stable Keychain ACL, so every launch asked for access.
+// Nothing writes to the Keychain any more.
+
+enum LegacyKeychain {
     static var service: String { Bundle.main.bundleIdentifier ?? "io.github.derkezorm.nexview.macos" }
     static let account = "store"
-    /// Set when the item exists but could not be read, so a save can't overwrite data we never saw.
-    static var writesBlocked = false
 
     enum ReadResult { case missing, data(Data), failure(OSStatus) }
 
@@ -98,15 +107,25 @@ enum KeychainStore {
         "\(st) (\((SecCopyErrorMessageString(st, nil) as String?) ?? "unknown error"))"
     }
 
-    static func query(_ account: String) -> [String: Any] {
-        var q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-                                kSecAttrService as String: service,
-                                kSecAttrAccount as String: account]
-        return q
+    static var query: [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: service,
+         kSecAttrAccount as String: account]
     }
 
-    static func read(account: String = account) -> ReadResult {
-        var q = query(account)
+    /// Checks whether the item exists without reading its data (attributes only: no access prompt).
+    static func exists() -> Bool {
+        var q = query
+        q[kSecReturnAttributes as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: CFTypeRef?
+        let st = SecItemCopyMatching(q as CFDictionary, &out)
+        return st != errSecItemNotFound
+    }
+
+    /// Reads the data. This is the one access that may show the Keychain prompt.
+    static func read() -> ReadResult {
+        var q = query
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
         var out: CFTypeRef?
@@ -120,56 +139,122 @@ enum KeychainStore {
         }
     }
 
-    /// Updates the item, or adds it when it doesn't exist yet.
-    @discardableResult
-    static func write(_ d: Data, account: String = account) -> OSStatus {
-        let st = SecItemUpdate(query(account) as CFDictionary, [kSecValueData as String: d] as CFDictionary)
-        guard st == errSecItemNotFound else { return st }
-        var add = query(account)
-        add[kSecValueData as String] = d
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        add[kSecAttrLabel as String] = "Nexview for Mac"
-        return SecItemAdd(add as CFDictionary, nil)
+    /// Deletes the item. Failure is not fatal: store.json now exists, so the item is never read again.
+    /// The "store.corrupt.*" copies older builds may have made are left alone: deleting items this app
+    /// doesn't have access to could show more prompts, and they hold no passwords.
+    static func delete() {
+        let st = SecItemDelete(query as CFDictionary)
+        if st == errSecSuccess || st == errSecItemNotFound {
+            storeLog.notice("Legacy Keychain item deleted")
+        } else {
+            storeLog.error("Could not delete the legacy Keychain item: \(describe(st), privacy: .public); it won't be read again")
+        }
     }
 }
 
-// MARK: loading at launch, including the one-time move out of the old Secure Enclave vault
+// MARK: loading at launch (once), including the one-time moves out of the Keychain and the old vault
 
 enum StoreLoader {
     struct Message { var title: String; var text: String }
 
+    /// The result of the single launch-time read; later calls return it instead of reading again.
+    private static var cached: (store: ServerStore, alert: Message?)?
+
     static func load() -> (store: ServerStore, alert: Message?) {
-        switch KeychainStore.read() {
+        if let c = cached { return c }
+        let r = loadOnce()
+        cached = r
+        return r
+    }
+
+    private static func loadOnce() -> (store: ServerStore, alert: Message?) {
+        // (a) store.json exists: use it and never touch the Keychain.
+        switch FileStore.read(StoreFile.url) {
         case .data(let d):
             do { return (try JSONDecoder().decode(ServerStore.self, from: d), nil) } catch {
-                storeLog.error("Keychain store is undecodable: \(error.localizedDescription, privacy: .public)")
-                return resetCorrupt(d)
+                storeLog.error("store.json is undecodable: \(error.localizedDescription, privacy: .public)")
+                return setAsideCorrupt()
             }
-        case .failure(let st):
-            storeLog.error("Reading the Keychain store failed: \(KeychainStore.describe(st), privacy: .public)")
-            KeychainStore.writesBlocked = true
+        case .failure(let e):
+            storeLog.error("Reading store.json failed: \(e.localizedDescription, privacy: .public)")
+            StoreFile.writesBlocked = true
             return (ServerStore(), Message(title: "Nexview couldn’t read its saved servers",
-                text: "The macOS Keychain refused access (\(KeychainStore.describe(st))). Nothing was changed; quit and reopen Nexview to try again. Changes made in this session won’t be saved."))
+                text: "\(StoreFile.url.path) could not be read (\(e.localizedDescription)). Nothing was changed; quit and reopen Nexview to try again. Changes made in this session won’t be saved."))
         case .missing:
-            return migrateLegacyVault()
+            break
+        }
+        // (b) the 0.1.4/0.1.5 Keychain item, (c) the 0.1.3 vault, (d) a fresh install.
+        if LegacyKeychain.exists() { return migrateKeychain() }
+        return migrateLegacyVault()
+    }
+
+    /// Keeps the undecodable file as store.corrupt-<timestamp>.json before starting over, never overwriting it.
+    static func setAsideCorrupt() -> (store: ServerStore, alert: Message?) {
+        do {
+            let dest = try FileStore.setAsideCorrupt(StoreFile.url)
+            storeLog.notice("Undecodable store.json kept as \(dest.lastPathComponent, privacy: .public)")
+            return (ServerStore(), Message(title: "Your saved servers couldn’t be read",
+                text: "Nexview’s saved data was damaged. A copy was kept as “\(dest.lastPathComponent)” in \(dest.deletingLastPathComponent().path). Please add your servers again in Settings."))
+        } catch {
+            storeLog.error("Could not set aside the undecodable store.json: \(String(describing: error), privacy: .public); leaving it untouched")
+            StoreFile.writesBlocked = true
+            return (ServerStore(), Message(title: "Nexview couldn’t read its saved servers",
+                text: "The saved data is damaged and could not be set aside, so it was left untouched. Changes made in this session won’t be saved."))
         }
     }
 
-    /// Keeps a copy of unreadable data as its own item before starting over, so nothing is lost silently.
-    static func resetCorrupt(_ d: Data) -> (store: ServerStore, alert: Message?) {
-        let stamp = ISO8601DateFormatter().string(from: Date())
-        let copy = "store.corrupt.\(stamp)"
-        let st = KeychainStore.write(d, account: copy)
-        guard st == errSecSuccess else {
-            storeLog.error("Could not back up the undecodable store: \(KeychainStore.describe(st), privacy: .public); leaving it untouched")
-            KeychainStore.writesBlocked = true
-            return (ServerStore(), Message(title: "Nexview couldn’t read its saved servers",
-                text: "The saved data in the Keychain is damaged and could not be backed up, so it was left untouched. Changes made in this session won’t be saved."))
+    /// Writes data to store.json and checks that reading it back gives the same bytes and decodes.
+    static func writeVerified(_ d: Data) -> Bool {
+        do { try FileStore.write(d, to: StoreFile.url) } catch {
+            storeLog.error("Migration: writing store.json failed: \(String(describing: error), privacy: .public)")
+            return false
         }
-        storeLog.notice("Undecodable store backed up to Keychain account \(copy, privacy: .public)")
-        ServerStore().save()
-        return (ServerStore(), Message(title: "Your saved servers couldn’t be read",
-            text: "Nexview’s saved data in the Keychain was damaged. A copy was kept in the Keychain as “\(copy)”. Please add your servers again in Settings."))
+        guard case .data(let back) = FileStore.read(StoreFile.url), back == d,
+              (try? JSONDecoder().decode(ServerStore.self, from: back)) != nil else {
+            storeLog.error("Migration: store.json read-back did not match")
+            return false
+        }
+        return true
+    }
+
+    /// One last Keychain read (one prompt), then the file takes over and the item is deleted.
+    static func migrateKeychain() -> (store: ServerStore, alert: Message?) {
+        switch LegacyKeychain.read() {
+        case .missing:
+            return migrateLegacyVault()
+        case .failure(let st):
+            storeLog.error("Reading the legacy Keychain store failed: \(LegacyKeychain.describe(st), privacy: .public)")
+            StoreFile.writesBlocked = true
+            return (ServerStore(), Message(title: "Nexview couldn’t read its saved servers",
+                text: "Nexview is moving your servers out of the macOS Keychain, but the Keychain refused access (\(LegacyKeychain.describe(st))). Nothing was changed; quit and reopen Nexview and choose Allow to finish the move. Changes made in this session won’t be saved."))
+        case .data(let d):
+            guard let store = try? JSONDecoder().decode(ServerStore.self, from: d) else {
+                // Keep the damaged bytes as a corrupt copy on disk, then start over with an empty file.
+                storeLog.error("Legacy Keychain store is undecodable")
+                let tmp = StoreFile.url
+                do {
+                    try FileStore.write(d, to: tmp)
+                    let dest = try FileStore.setAsideCorrupt(tmp)
+                    LegacyKeychain.delete()
+                    return (ServerStore(), Message(title: "Your saved servers couldn’t be read",
+                        text: "Nexview’s saved data in the Keychain was damaged. A copy was kept as “\(dest.lastPathComponent)” in \(dest.deletingLastPathComponent().path). Please add your servers again in Settings."))
+                } catch {
+                    storeLog.error("Could not keep a copy of the undecodable Keychain store: \(String(describing: error), privacy: .public); leaving it untouched")
+                    StoreFile.writesBlocked = true
+                    return (ServerStore(), Message(title: "Nexview couldn’t read its saved servers",
+                        text: "The saved data in the Keychain is damaged and could not be backed up, so it was left untouched. Changes made in this session won’t be saved."))
+                }
+            }
+            guard writeVerified(d) else {
+                // Keychain item kept, so the next launch tries again; block saves this session so a later
+                // save can't leave a file that differs from the item.
+                StoreFile.writesBlocked = true
+                return (store, nil)
+            }
+            LegacyKeychain.delete()
+            storeLog.notice("Migrated \(store.servers.count) server(s) from the Keychain to store.json")
+            return (store, nil)
+        }
     }
 
     static func migrateLegacyVault() -> (store: ServerStore, alert: Message?) {
@@ -179,29 +264,23 @@ enum StoreLoader {
             storeLog.error("Old vault could not be decrypted; keeping it as .bak")
             LegacyVault.setAside()
             return (ServerStore(), Message(title: "Please add your servers again",
-                text: "Nexview now keeps your servers in the macOS Keychain, but the old saved data on this Mac could not be read. It was kept as a backup (vault.bin.bak). Add your servers again in Settings; you sign in through the page as before."))
+                text: "The old saved data on this Mac could not be read. It was kept as a backup (vault.bin.bak). Add your servers again in Settings; you sign in through the page as before."))
         }
         let store: ServerStore
         do { store = try JSONDecoder().decode(ServerStore.self, from: plain) } catch {
             storeLog.error("Old vault decrypted but is undecodable: \(error.localizedDescription, privacy: .public); keeping it as .bak")
             LegacyVault.setAside()
             return (ServerStore(), Message(title: "Please add your servers again",
-                text: "Nexview now keeps your servers in the macOS Keychain, but the old saved data on this Mac could not be read. It was kept as a backup (vault.bin.bak). Add your servers again in Settings."))
+                text: "The old saved data on this Mac could not be read. It was kept as a backup (vault.bin.bak). Add your servers again in Settings."))
         }
         // Re-encoding drops the saved sign-ins (passwords): ServerStore has no field for them.
         guard let d = try? JSONEncoder().encode(store) else { return (store, nil) }
-        let st = KeychainStore.write(d)
-        guard st == errSecSuccess else {
-            storeLog.error("Migration: writing to the Keychain failed: \(KeychainStore.describe(st), privacy: .public); old vault kept")
-            return (store, nil)
-        }
-        guard case .data(let back) = KeychainStore.read(), back == d,
-              (try? JSONDecoder().decode(ServerStore.self, from: back)) != nil else {
-            storeLog.error("Migration: Keychain read-back did not match; old vault kept")
+        guard writeVerified(d) else {
+            storeLog.error("Migration: old vault kept")
             return (store, nil)
         }
         LegacyVault.deleteFiles()
-        storeLog.notice("Migrated \(store.servers.count) server(s) from the old vault to the Keychain; saved passwords deleted")
+        storeLog.notice("Migrated \(store.servers.count) server(s) from the old vault to store.json; saved passwords deleted")
         return (store, nil)
     }
 }
@@ -212,10 +291,7 @@ enum StoreLoader {
 // opaque handle lived in enclave.key next to vault.bin. Only reading it is kept here.
 
 enum LegacyVault {
-    static var dir: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Nexview for Mac", isDirectory: true)
-    }
+    static var dir: URL { FileStore.defaultDir }
     static var keyFile: URL { dir.appendingPathComponent("enclave.key") }
     static var vaultFile: URL { dir.appendingPathComponent("vault.bin") }
     static let info = Data("nexview-mac-vault-v1".utf8)

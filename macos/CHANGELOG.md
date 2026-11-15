@@ -2,6 +2,11 @@
 
 What changed in each version of Nexview for Mac. The release on GitHub and the update window show the section for that version.
 
+## 0.1.6
+
+### Fixed
+- No more Keychain password prompt at every launch. Servers and keys moved from the Keychain to a file only your user can read; updating asks one last time.
+
 ## 0.1.5
 
 ### Build
