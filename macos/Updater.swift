@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import UserNotifications
 
 /// Looks for new releases of Nexview for Mac on GitHub and, when asked, installs one and restarts.
@@ -7,8 +8,14 @@ final class Updater: NSObject {
     static let shared = Updater()
     static let latestURL = URL(string: "https://api.github.com/repos/J0n4e/nexview_mac/releases/latest")!
     static let bundleID = "io.github.derkezorm.nexview.macos"
+    /// Release assets are only ever fetched from this repo's GitHub release downloads.
+    static let downloadPrefix = "https://github.com/J0n4e/nexview_mac/releases/download/"
+    /// Ed25519 public key (raw 32 bytes, base64) whose private half signs every release zip.
+    /// The app is only ad-hoc code signed, so this signature is the real trust anchor for updates.
+    static let signingPublicKey = "QZNsnKHonvP62BxLWUxBUfej1aqt65ao2TeYBEeZNKk="
 
-    struct Release { let version: String; let notes: String; let zip: URL }
+    /// `zip`/`sig` are nil when the release exists but lacks a usable asset.
+    struct Release { let version: String; let notes: String; let zip: URL?; let sig: URL? }
 
     var pending: Release?
     var timer: Timer?
@@ -62,12 +69,31 @@ final class Updater: NSObject {
               let tag = j["tag_name"] as? String else { return nil }
         let version = String(tag.drop(while: { $0 == "v" || $0 == "V" }))
         let assets = j["assets"] as? [[String: Any]] ?? []
-        guard let zip = assets.first(where: { $0["name"] as? String == "Nexview-\(version).zip" })?["browser_download_url"] as? String,
-              let url = URL(string: zip) else { return nil }
-        return Release(version: version, notes: j["body"] as? String ?? "", zip: url)
+        func asset(_ name: String) -> URL? {
+            guard let s = assets.first(where: { $0["name"] as? String == name })?["browser_download_url"] as? String,
+                  s.hasPrefix(downloadPrefix), let u = URL(string: s), u.scheme == "https", u.host == "github.com" else { return nil }
+            return u
+        }
+        return Release(version: version, notes: j["body"] as? String ?? "",
+                       zip: asset("Nexview-\(version).zip"), sig: asset("Nexview-\(version).zip.sig"))
+    }
+
+    /// True if `signatureBase64` is a valid Ed25519 signature over exactly `data` by the raw 32-byte key `publicKeyBase64`.
+    static func verifySignature(data: Data, signatureBase64: String, publicKeyBase64: String) -> Bool {
+        guard let keyData = Data(base64Encoded: publicKeyBase64.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let sig = Data(base64Encoded: signatureBase64.trimmingCharacters(in: .whitespacesAndNewlines)),
+              sig.count == 64,
+              let key = try? Curve25519.Signing.PublicKey(rawRepresentation: keyData) else { return false }
+        return key.isValidSignature(sig, for: data)
     }
 
     func found(_ release: Release?, reached: Bool, manual: Bool) {
+        if installing { return }
+        if let r = release, Self.isNewer(r.version, than: current), r.zip == nil || r.sig == nil {
+            if manual { alert("Could not check for updates.",
+                              "Nexview for Mac \(r.version) was released, but its download or signature is missing. Try again later.") }
+            return
+        }
         guard let r = release, Self.isNewer(r.version, than: current) else {
             if manual { alert(reached ? "You're up to date." : "Could not check for updates.",
                               reached ? "Nexview for Mac \(current) is the newest version." : "GitHub could not be reached. Try again later.") }
@@ -89,7 +115,7 @@ final class Updater: NSObject {
     // MARK: window
 
     @objc func showPending() {
-        guard let r = pending else { return }
+        guard !installing, let r = pending else { return }
         window?.close()
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
                          styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
@@ -171,7 +197,7 @@ final class Updater: NSObject {
             let para = NSMutableParagraphStyle()
             para.paragraphSpacingBefore = kinds.contains(where: { if case .listItem = $0 { return true }; return false }) ? 2 : 8
             attrs[.paragraphStyle] = para
-            if let link = run.link { attrs[.link] = link }
+            if let link = run.link, link.scheme?.lowercased() == "https" { attrs[.link] = link }
             out.append(NSAttributedString(string: piece, attributes: attrs))
         }
         return out
@@ -184,6 +210,9 @@ final class Updater: NSObject {
 
     @objc func installPending() {
         guard let r = pending, !installing else { return }
+        guard let zipURL = r.zip, let sigURL = r.sig else {
+            alert("Could not install the update.", "This release has no signed download."); return
+        }
         installing = true
         let target = Bundle.main.bundleURL
         guard FileManager.default.isWritableFile(atPath: target.deletingLastPathComponent().path) else {
@@ -192,50 +221,86 @@ final class Updater: NSObject {
             return
         }
         window?.title = "Downloading \(r.version)…"
-        URLSession.shared.downloadTask(with: r.zip) { file, resp, err in
-            let result: Result<URL, Error>
-            if let file, (resp as? HTTPURLResponse)?.statusCode == 200 { result = Result { try self.unpack(file, expecting: r.version) } }
-            else { result = .failure(UpdateError(err?.localizedDescription ?? "The download failed.")) }
+        let fail: (Error) -> Void = { e in
             DispatchQueue.main.async {
-                switch result {
-                case .success(let app): self.swap(in: app, for: target)
-                case .failure(let e):
-                    self.installing = false
-                    self.window?.title = "Software Update"
-                    self.alert("Could not install the update.", (e as? UpdateError)?.text ?? e.localizedDescription)
-                }
+                self.installing = false
+                self.window?.title = "Software Update"
+                self.alert("Could not install the update.", (e as? UpdateError)?.text ?? e.localizedDescription)
             }
+        }
+        URLSession.shared.dataTask(with: sigURL) { sigData, sigResp, sigErr in
+            guard let sigData, (sigResp as? HTTPURLResponse)?.statusCode == 200,
+                  let sigText = String(data: sigData, encoding: .utf8) else {
+                return fail(UpdateError(sigErr?.localizedDescription ?? "The update's signature could not be downloaded."))
+            }
+            URLSession.shared.downloadTask(with: zipURL) { file, resp, err in
+                guard let file, (resp as? HTTPURLResponse)?.statusCode == 200 else {
+                    return fail(UpdateError(err?.localizedDescription ?? "The download failed."))
+                }
+                // The temp file is deleted when this handler returns, so move it somewhere we own first.
+                let dir = FileManager.default.temporaryDirectory.appendingPathComponent("nexview-update-\(UUID().uuidString)")
+                let zip = dir.appendingPathComponent("Nexview.zip")
+                do {
+                    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                    try FileManager.default.moveItem(at: file, to: zip)
+                } catch {
+                    try? FileManager.default.removeItem(at: dir)
+                    return fail(error)
+                }
+                // Verification and unpacking run off the main thread; only UI hops back.
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        let app = try self.verifyAndUnpack(zip, signature: sigText, into: dir, expecting: r.version)
+                        DispatchQueue.main.async { self.swap(in: app, for: target, cleaning: dir) }
+                    } catch {
+                        try? FileManager.default.removeItem(at: dir)
+                        fail(error)
+                    }
+                }
+            }.resume()
         }.resume()
     }
 
     struct UpdateError: Error { let text: String; init(_ t: String) { text = t } }
 
-    /// Unzips next to nothing that matters, then checks it is Nexview for Mac at the expected, newer version.
-    func unpack(_ zip: URL, expecting version: String) throws -> URL {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("nexview-update-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        guard run("/usr/bin/ditto", ["-x", "-k", zip.path, dir.path]) else { throw UpdateError("The download could not be unpacked.") }
-        let app = dir.appendingPathComponent("Nexview.app")
+    /// Checks the Ed25519 signature over the exact zip bytes before touching its contents, then unzips it
+    /// and checks it is a validly code-signed Nexview for Mac at the expected, newer version.
+    func verifyAndUnpack(_ zip: URL, signature: String, into dir: URL, expecting version: String) throws -> URL {
+        guard let bytes = try? Data(contentsOf: zip),
+              Self.verifySignature(data: bytes, signatureBase64: signature, publicKeyBase64: Self.signingPublicKey) else {
+            throw UpdateError("The download's signature is missing or invalid, so it was not installed.")
+        }
+        let out = dir.appendingPathComponent("unpacked")
+        guard run("/usr/bin/ditto", ["-x", "-k", zip.path, out.path]) else { throw UpdateError("The download could not be unpacked.") }
+        let app = out.appendingPathComponent("Nexview.app")
         guard let b = Bundle(url: app), b.bundleIdentifier == Self.bundleID,
               let v = b.infoDictionary?["CFBundleShortVersionString"] as? String, v == version, Self.isNewer(v, than: current)
         else { throw UpdateError("The download is not a newer Nexview for Mac.") }
-        _ = run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
+        // The bundle is only ad-hoc signed, so this just proves it is intact and internally consistent;
+        // the Ed25519 check above is what establishes that it came from us.
+        guard run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path]) else {
+            throw UpdateError("The downloaded app failed its code signature check.")
+        }
+        // No quarantine stripping: URLSession downloads aren't quarantined (no LSFileQuarantineEnabled).
         return app
     }
 
     /// The running app can't replace itself, so a short script waits for it to quit, swaps the bundle and reopens it.
-    func swap(in app: URL, for target: URL) {
+    func swap(in app: URL, for target: URL, cleaning dir: URL) {
         let script = """
         while kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do sleep 0.2; done
         old="$2.old-$$"
         mv "$2" "$old" && { mv "$1" "$2" && rm -rf "$old" || mv "$old" "$2"; }
         open "$2"
+        rm -rf "$3"
         """
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-c", script, "nexview-update", app.path, target.path]
+        p.arguments = ["-c", script, "nexview-update", app.path, target.path, dir.path]
         do { try p.run() } catch {
+            try? FileManager.default.removeItem(at: dir)
             installing = false
+            window?.title = "Software Update"
             alert("Could not install the update.", error.localizedDescription); return
         }
         NSApp.terminate(nil)
