@@ -2,7 +2,7 @@
 
 What changed in each version of Nexview for Mac. The release on GitHub and the update window show the section for that version.
 
-## Unreleased
+## 0.1.5
 
 ### Build
 - Signed with a stable Nexview code-signing certificate, so macOS no longer asks for Keychain access after every update (one last time when updating from 0.1.4).
