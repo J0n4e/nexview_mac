@@ -1,9 +1,10 @@
 import AppKit
 import CryptoKit
+import Security
 import UserNotifications
 
 /// Looks for new releases of Nexview for Mac on GitHub and, when asked, installs one and restarts.
-/// The app is signed ad hoc and built without Xcode, so this is a small updater of its own, not Sparkle.
+/// The app is built without Xcode and not notarized, so this is a small updater of its own, not Sparkle.
 final class Updater: NSObject {
     static let shared = Updater()
     static let latestURL = URL(string: "https://api.github.com/repos/J0n4e/nexview_mac/releases/latest")!
@@ -11,7 +12,7 @@ final class Updater: NSObject {
     /// Release assets are only ever fetched from this repo's GitHub release downloads.
     static let downloadPrefix = "https://github.com/J0n4e/nexview_mac/releases/download/"
     /// Ed25519 public key (raw 32 bytes, base64) whose private half signs every release zip.
-    /// The app is only ad-hoc code signed, so this signature is the real trust anchor for updates.
+    /// The app is self-signed (not notarized), so this signature is the real trust anchor for updates.
     static let signingPublicKey = "QZNsnKHonvP62BxLWUxBUfej1aqt65ao2TeYBEeZNKk="
 
     /// `zip`/`sig` are nil when the release exists but lacks a usable asset.
@@ -366,13 +367,35 @@ final class Updater: NSObject {
         guard let b = Bundle(url: app), b.bundleIdentifier == Self.bundleID,
               let v = b.infoDictionary?["CFBundleShortVersionString"] as? String, v == version, Self.isNewer(v, than: current)
         else { throw UpdateError("The download is not a newer Nexview for Mac.") }
-        // The bundle is only ad-hoc signed, so this just proves it is intact and internally consistent;
-        // the Ed25519 check above is what establishes that it came from us.
+        // Proves the bundle is intact and internally consistent; the Ed25519 check above is what
+        // establishes that it came from us.
         guard run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path]) else {
             throw UpdateError("The downloaded app failed its code signature check.")
         }
+        // When this app is signed with the Nexview certificate, the new one must satisfy the same designated
+        // requirement, so the Keychain keeps trusting it. Skipped for ad-hoc builds (e.g. updating from 0.1.4).
+        guard Self.satisfiesDesignatedRequirement(of: Bundle.main.bundleURL, candidate: app) else {
+            throw UpdateError("The downloaded app is not signed with the Nexview for Mac certificate.")
+        }
         // No quarantine stripping: URLSession downloads aren't quarantined (no LSFileQuarantineEnabled).
         return app
+    }
+
+    /// True if `running` is ad-hoc signed or unsigned (nothing to pin), or if `candidate` satisfies
+    /// `running`'s designated requirement.
+    static func satisfiesDesignatedRequirement(of running: URL, candidate: URL) -> Bool {
+        var cur: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(running as CFURL, [], &cur) == errSecSuccess, let cur else { return true }
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(cur, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+              let dict = info as? [String: Any],
+              let certs = dict[kSecCodeInfoCertificates as String] as? [SecCertificate], !certs.isEmpty
+        else { return true } // ad-hoc or unsigned: no certificate to pin
+        var req: SecRequirement?
+        guard SecCodeCopyDesignatedRequirement(cur, [], &req) == errSecSuccess, let req else { return false }
+        var new: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(candidate as CFURL, [], &new) == errSecSuccess, let new else { return false }
+        return SecStaticCodeCheckValidity(new, SecCSFlags(rawValue: kSecCSCheckAllArchitectures), req) == errSecSuccess
     }
 
     static var updateLogURL: URL {
