@@ -58,7 +58,7 @@ jobs:
           [ ${#tests[@]} -gt 0 ] || { echo "no tests found"; exit 1; }
           for t in "${tests[@]}"; do
             echo "==> $t"
-            swiftc -parse-as-library macos/Updater.swift macos/ServerURL.swift macos/Backoff.swift "$t" -o "$RUNNER_TEMP/test-bin"
+            swiftc -parse-as-library macos/Updater.swift macos/ServerURL.swift macos/Backoff.swift macos/FileStore.swift "$t" -o "$RUNNER_TEMP/test-bin"
             "$RUNNER_TEMP/test-bin"
           done
 

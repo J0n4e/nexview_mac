@@ -58,8 +58,9 @@ You sign in through Nexview's own sign-in page, just like in a browser. The sess
 signed in, so you don't have to sign in every time you open the app. Nexview for Mac doesn't
 store your password.
 
-Your servers and the read-only access keys used for notifications are stored in the macOS
-Keychain. They never leave the Mac.
+Your servers and the read-only notification keys are stored in a file only your macOS user can
+read (`~/Library/Application Support/Nexview for Mac/store.json`). No passwords are stored. Keep
+FileVault on, and encrypt Time Machine backups.
 
 ## Security notes
 
@@ -129,9 +130,8 @@ copy in `macos/codesign.crt`, SHA-1 `ED08276C01EE6B11A38901579F29C987F50CDF47`),
 the `NEXVIEW_CODESIGN_P12` and `NEXVIEW_CODESIGN_P12_PASSWORD` secrets into a temporary keychain.
 The designated requirement pins the bundle id and this certificate. It does not replace Apple
 notarization: the first install still needs right-click → **Open**. Its purpose is a stable
-identity, so the Keychain doesn't ask for access again after every update. The update from
-0.1.4 (signed ad hoc) to 0.1.5 may ask once more because the identity changes; after that it
-doesn't. The updater refuses updates that don't satisfy the running app's designated requirement.
+identity across updates. Nexview no longer keeps anything in the Keychain: updating from 0.1.5
+asks for Keychain access one last time, to move your servers into the file. The updater refuses updates that don't satisfy the running app's designated requirement.
 
 To verify a release by hand (needs OpenSSL 3; the `openssl` that ships with macOS is LibreSSL,
 so use `brew install openssl@3`):
