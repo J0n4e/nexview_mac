@@ -9,6 +9,7 @@
   let auth = null;
   let apiBase = null;     // everything before "/api/", so a URL base path behind a proxy keeps working
   let reported = false;
+  let keyId = null;       // id of the app's read-only key for this account (told by the app), deleted on sign-out
 
   const origFetch = window.fetch;
   window.fetch = async function (input, init) {
@@ -16,12 +17,19 @@
       const a = new Headers((init && init.headers) || (input instanceof Request ? input.headers : undefined)).get('authorization');
       if (a) auth = a;
     } catch (e) {}
+    const reqUrl = (() => { try { return typeof input === 'string' ? input : (input && input.url) || String(input || ''); } catch (e) { return ''; } })();
+    let deletedId = null;
+    // Signing out: delete the app's key on the server while the session is still valid.
+    if (/\/api\/auth\/logout/.test(reqUrl) && keyId && auth) {
+      const id = keyId;
+      try { if (await deleteKey(id)) deletedId = id; } catch (e) {}
+    }
     const res = await origFetch.apply(this, arguments);
     try {
-      const url = typeof input === 'string' ? input : (input && input.url) || '';
+      const url = reqUrl;
       const i = url.indexOf('/api/');
       if (i >= 0 && apiBase === null) apiBase = url.slice(0, i);
-      if (/\/api\/auth\/logout/.test(url)) { auth = null; reported = false; post({ type: 'signedOut' }); }
+      if (/\/api\/auth\/logout/.test(url)) { auth = null; reported = false; keyId = null; post({ type: 'signedOut', deletedId }); }
       else if (res.ok && /\/api\/notifications/.test(url)) post({ type: 'refresh' });  // read/cleared: update the badge now
       else if (res.ok && auth && !reported) reportSession();
       if (res.ok && auth) post({ type: 'alive' });
@@ -71,9 +79,28 @@
       const r = await api('/api/auth/me/schluessel', { method: 'POST', body: JSON.stringify({ name, nur_lesen: true }) });
       if (!r.ok) return;
       const k = await r.json();
+      keyId = k.id || null;
       const me = await (await api('/api/auth/me')).json();
       post({ type: 'apikey', key: k.schluessel, id: k.id, user: me.username });
     } catch (e) {}
+  };
+
+  async function deleteKey(id) {
+    const r = await api('/api/auth/me/schluessel/' + encodeURIComponent(id), { method: 'DELETE' });
+    return r.ok || r.status === 404;        // 404: already gone
+  }
+
+  // Called by the app: the id of its key for the signed-in account, so sign-out can delete it.
+  window.__nexviewMacSetKeyId = (id) => { keyId = id || null; };
+
+  // Called by the app to delete one of its keys with the page's session. Resolves true when gone.
+  window.__nexviewMacDeleteKey = async (id) => {
+    if (!auth || !id) return false;
+    try {
+      const ok = await deleteKey(id);
+      if (ok && keyId === id) keyId = null;
+      return ok;
+    } catch (e) { return false; }
   };
 
   // Called by the app when notifications were cleared in macOS: mark them read in Nexview.
