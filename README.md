@@ -34,14 +34,14 @@ the Mac.
 Requirements: an Apple Silicon Mac with the Xcode command line tools (`xcode-select --install`).
 
 ```sh
-./macos/build.sh
+zsh macos/build.sh
 ```
 
 This fetches Nexview's code into `src/` on the first run (only its icon and version are used)
 and builds `build/Nexview.app`. Copy it to `/Applications` to install it.
 
 ```sh
-./macos/update.sh
+zsh macos/update.sh
 ```
 
 pulls the latest Nexview and rebuilds.

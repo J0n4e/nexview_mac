@@ -11,4 +11,4 @@ if [[ "$OLD" == "$NEW" && "${1:-}" != "--force" && -d "$ROOT/build/Nexview.app" 
   echo "Already up to date ($(git describe --tags --always))."; exit 0
 fi
 git log --oneline "$OLD..$NEW" | head -30
-"$ROOT/macos/build.sh"
+zsh "$ROOT/macos/build.sh"
