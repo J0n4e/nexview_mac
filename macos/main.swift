@@ -4,7 +4,8 @@ import Cocoa
 import WebKit
 import CryptoKit
 import UserNotifications
-import LocalAuthentication
+import Security
+import os
 import ServiceManagement
 
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate,
@@ -12,13 +13,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     var window: NSWindow!
     var webView: WKWebView!
 
-    var store = ServerStore.load()
+    var store = ServerStore()
     var serverURL: URL? { store.current.flatMap { URL(string: $0.url) } }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // Menu bar icon first, before any window, as TokenEater does: menu bar managers
         // (Thaw, Ice, Bartender) pick items up as the app comes up.
         applyBackgroundMode()
+        // Touch ID sign-in was removed: drop its leftover preference.
+        UserDefaults.standard.removeObject(forKey: "TouchIDDeclined")
+        let loaded = StoreLoader.load()
+        store = loaded.store
         // One-time move of a server saved in plain text by an earlier build.
         if let old = UserDefaults.standard.string(forKey: "ServerURL") {
             if store.servers.isEmpty { store.add(Server(name: URL(string: old)?.host ?? "Server", url: old)) }
@@ -37,6 +42,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         watchForClears()
         Updater.shared.mainWindowVisible = { [weak self] in self?.window.isVisible == true }
         Updater.shared.start()
+        if let msg = loaded.alert {
+            DispatchQueue.main.async {
+                let a = NSAlert(); a.alertStyle = .warning
+                a.messageText = msg.title; a.informativeText = msg.text; a.runModal()
+            }
+        }
     }
 
     func buildWindow() {
@@ -95,7 +106,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         a.informativeText = "\(cur.url) will be removed from this Mac."
         a.addButton(withTitle: "Remove"); a.addButton(withTitle: "Cancel")
         guard a.runModal() == .alertFirstButtonReturn else { return }
-        Credentials.delete(server: cur.url)
         store.removeCurrent()
         if serverURL == nil { buildMenu(); askForServer(firstRun: true) } else { loadServer() }
     }
@@ -348,10 +358,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 store.apiKeys?[srv.url] = nil; store.save()
                 counts[srv.url] = nil; updateBadge()
             }
-        case "loginForm":
-            offerTouchIDLogin()
-        case "loggedIn":
-            if let user = m["user"] as? String, let pass = m["pass"] as? String { offerToSave(user: user, pass: pass) }
         default: break
         }
     }
@@ -430,7 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             let ids = items.compactMap { $0["id"] as? Int }
             removeDelivered(server: srv.url, keeping: Set(ids))
             pruneShown(server: srv.url, unread: Set(ids))
-            let tag = Credentials.tag(srv.url, key.user)
+            let tag = Self.notifyTag(srv.url, key.user)
             var seen = UserDefaults.standard.dictionary(forKey: "LastNotified") as? [String: Int] ?? [:]
             let maxID = ids.max() ?? 0
             guard let last = seen[tag] else {
@@ -611,47 +617,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         done()
     }
 
-    // MARK: Touch ID sign-in
-    var touchIDBusy = false
-
-    func offerTouchIDLogin() {
-        guard let srv = store.current, Credentials.exists(server: srv.url), !touchIDBusy else { return }
-        touchIDBusy = true
-        let ctx = LAContext()
-        ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "sign in to \(srv.name)") { ok, _ in
-            DispatchQueue.main.async {
-                self.touchIDBusy = false
-                guard ok, srv.url == self.store.current?.url, let cred = Credentials.load(server: srv.url) else { return }
-                let js = "window.__nexviewMacFill && window.__nexviewMacFill(\(Self.jsString(cred.user)), \(Self.jsString(cred.pass)))"
-                self.webView.evaluateJavaScript(js, completionHandler: nil)
-            }
-        }
-    }
-
     static func jsString(_ s: String) -> String {
         let d = try! JSONSerialization.data(withJSONObject: [s]); let a = String(data: d, encoding: .utf8)!
         return String(a.dropFirst().dropLast())
     }
 
-    func offerToSave(user: String, pass: String) {
-        guard let srv = store.current else { return }
-        if let have = Credentials.load(server: srv.url), have.user == user, have.pass == pass { return }
-        if Credentials.declined(server: srv.url, user: user) { return }
-        let a = NSAlert()
-        a.messageText = "Sign in to “\(srv.name)” with Touch ID next time?"
-        a.informativeText = "Your password for \(user) is encrypted by your Mac’s Secure Enclave and only filled in after Touch ID or your Mac password."
-        a.addButton(withTitle: "Use Touch ID"); a.addButton(withTitle: "Not Now"); a.addButton(withTitle: "Never for This Account")
-        switch a.runModal() {
-        case .alertFirstButtonReturn: Credentials.save(server: srv.url, user: user, pass: pass)
-        case .alertThirdButtonReturn: Credentials.decline(server: srv.url, user: user)
-        default: break
-        }
-    }
-
-    @objc func forgetSignIn() {
-        guard let srv = store.current else { return }
-        Credentials.delete(server: srv.url)
-        let a = NSAlert(); a.messageText = "Saved sign-in for “\(srv.name)” removed."; a.runModal()
+    /// Key for per-account state in prefs (LastNotified), hashed so neither server nor username is readable there.
+    static func notifyTag(_ server: String, _ user: String) -> String {
+        SHA256.hash(data: Data("\(user)@\(server)".utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: navigation – external links go to the default browser
@@ -755,24 +728,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     @objc func openBrowser() { if let u = webView.url ?? serverURL { NSWorkspace.shared.open(u) } }
 }
 
-// MARK: server list, encrypted by the Secure Enclave (see SecureVault), never in plain-text prefs
+// MARK: server list and read-only keys, kept in the macOS Keychain (never in plain-text prefs)
+
+let storeLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "io.github.derkezorm.nexview.macos", category: "store")
 
 struct Server: Codable { var name: String; var url: String }
 
 struct ServerStore: Codable {
     var servers: [Server] = []
     var selected = 0
-    var signins: [String: Credentials.Saved]? = [:]
     var apiKeys: [String: AccessKey]? = [:]
     var current: Server? { servers.indices.contains(selected) ? servers[selected] : nil }
 
-    static func load() -> ServerStore {
-        guard let d = SecureVault.read(), let s = try? JSONDecoder().decode(ServerStore.self, from: d) else { return ServerStore() }
-        return s
-    }
-
     func save() {
-        if let d = try? JSONEncoder().encode(self) { SecureVault.write(d) }
+        let d: Data
+        do { d = try JSONEncoder().encode(self) } catch {
+            storeLog.error("Encoding the store failed: \(error.localizedDescription, privacy: .public)"); return
+        }
+        guard !KeychainStore.writesBlocked else {
+            storeLog.error("Not saving: the Keychain item could not be read at launch and is left untouched"); return
+        }
+        let st = KeychainStore.write(d)
+        if st != errSecSuccess { storeLog.error("Saving the store to the Keychain failed: \(KeychainStore.describe(st), privacy: .public)") }
     }
 
     mutating func add(_ s: Server) {
@@ -802,51 +779,140 @@ struct ServerStore: Codable {
 /// A read-only Nexview access key the app made for itself, so it can check notifications on its own.
 struct AccessKey: Codable { var key: String; var id: Int; var user: String }
 
-// MARK: saved sign-ins for Touch ID, kept in the Secure Enclave vault
+// MARK: Keychain item
 
-enum Credentials {
-    struct Saved: Codable { var user: String; var pass: String }
-    // Sign-ins live in the same Secure Enclave–encrypted vault as the server list (see SecureVault).
-    static var app: AppDelegate { NSApp.delegate as! AppDelegate }
+/// One generic-password item (service = bundle id, account "store") holding the JSON-encoded store.
+/// No biometry or user presence is required to read it. Uses the login keychain: the data-protection
+/// keychain needs a signed application identifier, which ad-hoc builds don't have.
+enum KeychainStore {
+    static var service: String { Bundle.main.bundleIdentifier ?? "io.github.derkezorm.nexview.macos" }
+    static let account = "store"
+    /// Set when the item exists but could not be read, so a save can't overwrite data we never saw.
+    static var writesBlocked = false
 
-    static func exists(server: String) -> Bool { load(server: server) != nil }
-    static func load(server: String) -> Saved? { app.store.signins?[server] }
-    static func save(server: String, user: String, pass: String) {
-        var m = app.store.signins ?? [:]; m[server] = Saved(user: user, pass: pass)
-        app.store.signins = m; app.store.save()
-    }
-    static func delete(server: String) {
-        guard app.store.signins?[server] != nil else { return }
-        app.store.signins?[server] = nil; app.store.save()
+    enum ReadResult { case missing, data(Data), failure(OSStatus) }
+
+    static func describe(_ st: OSStatus) -> String {
+        "\(st) (\((SecCopyErrorMessageString(st, nil) as String?) ?? "unknown error"))"
     }
 
-    // "Never for this account" lives in prefs as a hash, so neither server nor username is readable there.
-    static func tag(_ server: String, _ user: String) -> String {
-        SHA256.hash(data: Data("\(user)@\(server)".utf8)).map { String(format: "%02x", $0) }.joined()
+    static func query(_ account: String) -> [String: Any] {
+        var q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                kSecAttrService as String: service,
+                                kSecAttrAccount as String: account]
+        return q
     }
-    static func declined(server: String, user: String) -> Bool {
-        (UserDefaults.standard.stringArray(forKey: "TouchIDDeclined") ?? []).contains(tag(server, user))
+
+    static func read(account: String = account) -> ReadResult {
+        var q = query(account)
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: CFTypeRef?
+        let st = SecItemCopyMatching(q as CFDictionary, &out)
+        switch st {
+        case errSecSuccess:
+            guard let d = out as? Data else { return .failure(errSecDecode) }
+            return .data(d)
+        case errSecItemNotFound: return .missing
+        default: return .failure(st)
+        }
     }
-    static func decline(server: String, user: String) {
-        var l = UserDefaults.standard.stringArray(forKey: "TouchIDDeclined") ?? []
-        l.append(tag(server, user)); UserDefaults.standard.set(l, forKey: "TouchIDDeclined")
+
+    /// Updates the item, or adds it when it doesn't exist yet.
+    @discardableResult
+    static func write(_ d: Data, account: String = account) -> OSStatus {
+        let st = SecItemUpdate(query(account) as CFDictionary, [kSecValueData as String: d] as CFDictionary)
+        guard st == errSecItemNotFound else { return st }
+        var add = query(account)
+        add[kSecValueData as String] = d
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        add[kSecAttrLabel as String] = "Nexview for Mac"
+        return SecItemAdd(add as CFDictionary, nil)
     }
 }
 
-// MARK: Secure Enclave vault
-//
-// Servers and saved sign-ins are encrypted with a key that lives inside this Mac's
-// Secure Enclave. The key never leaves the chip, so the file is useless on any other
-// machine or if copied off this one, and it never asks for a password when the
-// app is rebuilt or updated.
+// MARK: loading at launch, including the one-time move out of the old Secure Enclave vault
 
-enum SecureVault {
+enum StoreLoader {
+    struct Message { var title: String; var text: String }
+
+    static func load() -> (store: ServerStore, alert: Message?) {
+        switch KeychainStore.read() {
+        case .data(let d):
+            do { return (try JSONDecoder().decode(ServerStore.self, from: d), nil) } catch {
+                storeLog.error("Keychain store is undecodable: \(error.localizedDescription, privacy: .public)")
+                return resetCorrupt(d)
+            }
+        case .failure(let st):
+            storeLog.error("Reading the Keychain store failed: \(KeychainStore.describe(st), privacy: .public)")
+            KeychainStore.writesBlocked = true
+            return (ServerStore(), Message(title: "Nexview couldn’t read its saved servers",
+                text: "The macOS Keychain refused access (\(KeychainStore.describe(st))). Nothing was changed; quit and reopen Nexview to try again. Changes made in this session won’t be saved."))
+        case .missing:
+            return migrateLegacyVault()
+        }
+    }
+
+    /// Keeps a copy of unreadable data as its own item before starting over, so nothing is lost silently.
+    static func resetCorrupt(_ d: Data) -> (store: ServerStore, alert: Message?) {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let copy = "store.corrupt.\(stamp)"
+        let st = KeychainStore.write(d, account: copy)
+        guard st == errSecSuccess else {
+            storeLog.error("Could not back up the undecodable store: \(KeychainStore.describe(st), privacy: .public); leaving it untouched")
+            KeychainStore.writesBlocked = true
+            return (ServerStore(), Message(title: "Nexview couldn’t read its saved servers",
+                text: "The saved data in the Keychain is damaged and could not be backed up, so it was left untouched. Changes made in this session won’t be saved."))
+        }
+        storeLog.notice("Undecodable store backed up to Keychain account \(copy, privacy: .public)")
+        ServerStore().save()
+        return (ServerStore(), Message(title: "Your saved servers couldn’t be read",
+            text: "Nexview’s saved data in the Keychain was damaged. A copy was kept in the Keychain as “\(copy)”. Please add your servers again in Settings."))
+    }
+
+    static func migrateLegacyVault() -> (store: ServerStore, alert: Message?) {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: LegacyVault.vaultFile.path) else { return (ServerStore(), nil) }   // fresh install
+        guard let plain = LegacyVault.read() else {
+            storeLog.error("Old vault could not be decrypted; keeping it as .bak")
+            LegacyVault.setAside()
+            return (ServerStore(), Message(title: "Please add your servers again",
+                text: "Nexview now keeps your servers in the macOS Keychain, but the old saved data on this Mac could not be read. It was kept as a backup (vault.bin.bak). Add your servers again in Settings; you sign in through the page as before."))
+        }
+        let store: ServerStore
+        do { store = try JSONDecoder().decode(ServerStore.self, from: plain) } catch {
+            storeLog.error("Old vault decrypted but is undecodable: \(error.localizedDescription, privacy: .public); keeping it as .bak")
+            LegacyVault.setAside()
+            return (ServerStore(), Message(title: "Please add your servers again",
+                text: "Nexview now keeps your servers in the macOS Keychain, but the old saved data on this Mac could not be read. It was kept as a backup (vault.bin.bak). Add your servers again in Settings."))
+        }
+        // Re-encoding drops the saved sign-ins (passwords): ServerStore has no field for them.
+        guard let d = try? JSONEncoder().encode(store) else { return (store, nil) }
+        let st = KeychainStore.write(d)
+        guard st == errSecSuccess else {
+            storeLog.error("Migration: writing to the Keychain failed: \(KeychainStore.describe(st), privacy: .public); old vault kept")
+            return (store, nil)
+        }
+        guard case .data(let back) = KeychainStore.read(), back == d,
+              (try? JSONDecoder().decode(ServerStore.self, from: back)) != nil else {
+            storeLog.error("Migration: Keychain read-back did not match; old vault kept")
+            return (store, nil)
+        }
+        LegacyVault.deleteFiles()
+        storeLog.notice("Migrated \(store.servers.count) server(s) from the old vault to the Keychain; saved passwords deleted")
+        return (store, nil)
+    }
+}
+
+// MARK: legacy Secure Enclave vault (read-only, for the one-time migration)
+//
+// Up to 0.1.3 the store, including saved passwords, was encrypted with a Secure Enclave key whose
+// opaque handle lived in enclave.key next to vault.bin. Only reading it is kept here.
+
+enum LegacyVault {
     static var dir: URL {
-        let d = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Nexview for Mac", isDirectory: true)
-        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true,
-                                                 attributes: [.posixPermissions: 0o700])
-        return d
     }
     static var keyFile: URL { dir.appendingPathComponent("enclave.key") }
     static var vaultFile: URL { dir.appendingPathComponent("vault.bin") }
@@ -854,41 +920,39 @@ enum SecureVault {
 
     struct Sealed: Codable { var ephemeral: Data; var box: Data }
 
-    /// The Secure Enclave key (stored only as an opaque handle that just this Mac's chip can use).
-    static func enclaveKey(create: Bool) -> SecureEnclave.P256.KeyAgreement.PrivateKey? {
-        if let blob = try? Data(contentsOf: keyFile),
-           let k = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: blob) { return k }
-        guard create, SecureEnclave.isAvailable, let k = try? SecureEnclave.P256.KeyAgreement.PrivateKey() else { return nil }
-        try? k.dataRepresentation.write(to: keyFile, options: [.atomic])
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyFile.path)
-        return k
-    }
-
-    static func symmetric(_ secret: SharedSecret) -> SymmetricKey {
-        secret.hkdfDerivedSymmetricKey(using: SHA256.self, salt: Data(), sharedInfo: info, outputByteCount: 32)
-    }
-
-    static func write(_ plain: Data) {
-        guard let k = enclaveKey(create: true) else { return }
-        let eph = P256.KeyAgreement.PrivateKey()
-        guard let secret = try? eph.sharedSecretFromKeyAgreement(with: k.publicKey),
-              let box = try? AES.GCM.seal(plain, using: symmetric(secret)).combined,
-              let out = try? JSONEncoder().encode(Sealed(ephemeral: eph.publicKey.rawRepresentation, box: box)) else { return }
-        try? out.write(to: vaultFile, options: [.atomic])
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: vaultFile.path)
-    }
-
     static func read() -> Data? {
         guard let raw = try? Data(contentsOf: vaultFile),
               let sealed = try? JSONDecoder().decode(Sealed.self, from: raw),
-              let k = enclaveKey(create: false),
+              let blob = try? Data(contentsOf: keyFile),
+              let k = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: blob),
               let eph = try? P256.KeyAgreement.PublicKey(rawRepresentation: sealed.ephemeral),
               let secret = try? k.sharedSecretFromKeyAgreement(with: eph),
               let box = try? AES.GCM.SealedBox(combined: sealed.box) else { return nil }
-        return try? AES.GCM.open(box, using: symmetric(secret))
+        let key = secret.hkdfDerivedSymmetricKey(using: SHA256.self, salt: Data(), sharedInfo: info, outputByteCount: 32)
+        return try? AES.GCM.open(box, using: key)
+    }
+
+    /// The Secure Enclave key exists only as this opaque file (no Keychain reference), so deleting it destroys the key.
+    static func deleteFiles() {
+        for f in [vaultFile, keyFile] where FileManager.default.fileExists(atPath: f.path) {
+            do { try FileManager.default.removeItem(at: f) } catch {
+                storeLog.error("Could not delete \(f.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    /// Unreadable: keep both files as .bak (never delete them) and start empty.
+    static func setAside() {
+        let fm = FileManager.default
+        for f in [vaultFile, keyFile] where fm.fileExists(atPath: f.path) {
+            var dest = f.appendingPathExtension("bak")
+            if fm.fileExists(atPath: dest.path) { dest = f.appendingPathExtension("\(Int(Date().timeIntervalSince1970)).bak") }
+            do { try fm.moveItem(at: f, to: dest) } catch {
+                storeLog.error("Could not rename \(f.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 }
-
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

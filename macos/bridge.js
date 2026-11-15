@@ -1,8 +1,7 @@
-// Injected into the Nexview page. Two jobs:
-//  1. Give the native app its own read-only access key for this account, so the app can check
-//     notifications by itself, even with the window closed. The page's session token never
-//     leaves the page; only the read-only key is handed over.
-//  2. Touch ID sign-in.
+// Injected into the Nexview page. Its job:
+// give the native app its own read-only access key for this account, so the app can check
+// notifications by itself, even with the window closed. The page's session token and the
+// password never leave the page; only the read-only key is handed over.
 (() => {
   if (window.__nexviewMac) return;
   window.__nexviewMac = true;
@@ -90,36 +89,4 @@
     if (done.length) post({ type: 'marked', ids: done });
   };
 
-  // --- Touch ID sign-in ---------------------------------------------------
-  let offered = false;
-  function loginForm() {
-    const pw = document.querySelector('input[type="password"][autocomplete="current-password"]');
-    return pw ? { pw, form: pw.form, user: pw.form && pw.form.querySelector('input[autocomplete="username"]') } : null;
-  }
-  function watchLogin() {
-    const f = loginForm();
-    if (!f || !f.form || !f.user) { offered = false; return; }
-    if (f.form.__nexviewMac) return;
-    f.form.__nexviewMac = true;
-    f.form.addEventListener('submit', () => {
-      const user = f.user.value, pass = f.pw.value;
-      if (!user || !pass) return;
-      setTimeout(() => { if (!loginForm()) post({ type: 'loggedIn', user, pass }); }, 2500);
-    }, true);
-    if (!offered) { offered = true; post({ type: 'loginForm' }); }
-  }
-  new MutationObserver(watchLogin).observe(document.documentElement, { childList: true, subtree: true });
-
-  const setValue = (el, v) => {
-    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-  };
-  window.__nexviewMacFill = (user, pass) => {
-    const f = loginForm();
-    if (!f) return false;
-    setValue(f.user, user); setValue(f.pw, pass);
-    f.form.__nexviewMacAuto = true;
-    setTimeout(() => f.form.requestSubmit(), 50);
-    return true;
-  };
 })();

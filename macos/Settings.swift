@@ -4,7 +4,7 @@ import SwiftUI
 import UserNotifications
 import WebKit
 
-// MARK: preferences (no secrets here; servers and passwords live in the Secure Enclave vault)
+// MARK: preferences (no secrets here; servers and access keys live in the macOS Keychain)
 
 enum Prefs {
     static let d = UserDefaults.standard
@@ -36,12 +36,10 @@ final class SettingsModel: ObservableObject {
     @Published var servers: [Server] = []
     @Published var selected = 0
     @Published var health: [String: Health] = [:]
-    @Published var signIns: Set<String> = []
 
     func refresh() {
         servers = app.store.servers
         selected = app.store.selected
-        signIns = Set(servers.map(\.url).filter { Credentials.exists(server: $0) })
     }
 
     func checkAll() { servers.forEach { check($0.url) } }
@@ -75,7 +73,6 @@ final class SettingsModel: ObservableObject {
 
     func remove(_ i: Int) {
         let wasActive = i == app.store.selected
-        Credentials.delete(server: servers[i].url)
         app.store.remove(i)
         if app.store.current == nil { app.webView.loadHTMLString("", baseURL: nil); app.window.title = "Nexview" }
         else if wasActive { app.loadServer() }
@@ -83,8 +80,6 @@ final class SettingsModel: ObservableObject {
     }
 
     func move(_ from: IndexSet, _ to: Int) { app.store.move(from: from, to: to); app.buildMenu(); refresh() }
-
-    func forgetSignIn(_ url: String) { Credentials.delete(server: url); refresh() }
 }
 
 /// Local view state without the @State macro (the command-line toolchain lacks SwiftUI's macro plugin).
@@ -211,10 +206,10 @@ struct StatusDot: View {
 // MARK: Settings
 
 enum Pane: String, CaseIterable, Identifiable {
-    case servers = "Servers", signIn = "Sign-In", notifications = "Notifications", general = "General"
+    case servers = "Servers", notifications = "Notifications", general = "General"
     var id: String { rawValue }
     var symbol: String {
-        switch self { case .servers: "server.rack"; case .signIn: "touchid"; case .notifications: "bell"; case .general: "gearshape" }
+        switch self { case .servers: "server.rack"; case .notifications: "bell"; case .general: "gearshape" }
     }
 }
 
@@ -231,7 +226,6 @@ struct SettingsView: View {
                 Group {
                     switch pane.v {
                     case .servers: ServersPane()
-                    case .signIn: SignInPane()
                     case .notifications: NotificationsPane()
                     case .general: GeneralPane()
                     }
@@ -321,7 +315,7 @@ struct ServersPane: View {
             Button("Remove", role: .destructive) { if let i = confirmRemove.v { model.remove(i) } }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Its address and any saved Touch ID sign-in will be deleted from this Mac.")
+            Text("Its address and the app’s read-only access key will be deleted from this Mac.")
         }
     }
 
@@ -448,49 +442,6 @@ struct ServerEditor: View {
             SettingsModel.shared.save(Server(name: name.isEmpty ? (u.host ?? "Server") : name, url: u.absoluteString), at: index)
             dismiss()
         }
-    }
-}
-
-struct SignInPane: View {
-    @ObservedObject var model = SettingsModel.shared
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            header("Sign-in", "Sign in with Touch ID instead of typing your password.")
-            Card {
-                HStack(alignment: .top, spacing: 14) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 11, style: .continuous).fill(NX.gradient)
-                        Image(systemName: "touchid").font(.system(size: 22)).foregroundColor(.white)
-                    }.frame(width: 44, height: 44)
-                    Text("After you sign in once, Nexview can keep your password encrypted by the Secure Enclave and fill it in after Touch ID or your Mac password. Every server is separate.")
-                        .font(.system(size: 13)).foregroundColor(NX.mist300).fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            Card(title: "Saved sign-ins") {
-                if model.servers.isEmpty { Text("No servers").foregroundColor(NX.mist500) }
-                ForEach(Array(model.servers.enumerated()), id: \.element.url) { i, srv in
-                    if i > 0 { Rectangle().fill(NX.ink700).frame(height: 1) }
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(srv.name).font(.system(size: 13, weight: .semibold)).foregroundColor(NX.mist100)
-                            Text(URL(string: srv.url)?.host ?? srv.url).font(.system(size: 12)).foregroundColor(NX.mist500)
-                        }
-                        Spacer()
-                        if model.signIns.contains(srv.url) {
-                            Label("Saved", systemImage: "checkmark.seal.fill").font(.system(size: 12, weight: .medium)).foregroundColor(NX.ok)
-                            Button("Forget") { model.forgetSignIn(srv.url) }.buttonStyle(NXButton(kind: .danger))
-                        } else {
-                            Text("Not saved").font(.system(size: 12)).foregroundColor(NX.mist600)
-                        }
-                    }
-                }
-            }
-            Card(title: "Declined accounts", subtitle: "Accounts you answered “Never” for won’t be asked again.") {
-                Button("Ask again for all accounts") { UserDefaults.standard.removeObject(forKey: "TouchIDDeclined") }
-                    .buttonStyle(NXButton())
-            }
-        }
-        .onAppear { model.refresh() }
     }
 }
 
