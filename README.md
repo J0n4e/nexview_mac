@@ -6,6 +6,9 @@ Mac window, with native notifications, a menu bar icon and Touch ID sign-in.
 
 Apple Silicon only, macOS 14 Sonoma or newer.
 
+> **Community app:** this is not an official Nexview project. Please report problems with the
+> Mac app [here](https://github.com/J0n4e/nexview_mac/issues), not in the Nexview repository.
+
 ## How it works
 
 Every Nexview screen and feature comes live from your server, so the app always matches the
