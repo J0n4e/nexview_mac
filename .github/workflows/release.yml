@@ -1,0 +1,59 @@
+# Builds Nexview for Mac on an Apple Silicon runner and publishes a GitHub release
+# whenever macos/VERSION on main holds a version that has not been released yet.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: ["macos/**", ".github/workflows/release.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: echo "value=$(tr -d '[:space:]' < macos/VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if already released
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.version.outputs.value }}" >/dev/null 2>&1; then
+            echo "Release v${{ steps.version.outputs.value }} already exists, nothing to do."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.check.outputs.exists == 'false'
+        run: zsh macos/build.sh
+
+      - name: Package
+        if: steps.check.outputs.exists == 'false'
+        run: ditto -c -k --keepParent build/Nexview.app "Nexview-${{ steps.version.outputs.value }}.zip"
+
+      - name: Publish release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          cat > notes.md <<NOTES
+          Nexview for Mac $VERSION for Apple Silicon Macs (macOS 14 Sonoma or newer).
+
+          **Install:** download \`Nexview-$VERSION.zip\`, unzip it and move **Nexview** to Applications.
+          The app is signed ad hoc, so the first time you open it, right-click it and choose **Open**.
+
+          Then enter the address of your Nexview server and sign in with your Nexview account.
+          NOTES
+          gh release create "v$VERSION" "Nexview-$VERSION.zip" \
+            --title "Nexview for Mac $VERSION" --notes-file notes.md --target "$GITHUB_SHA"

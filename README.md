@@ -29,6 +29,13 @@ Server addresses, saved sign-ins and access keys are encrypted with a key held i
 Secure Enclave and stored in `~/Library/Application Support/Nexview for Mac/`. They never leave
 the Mac.
 
+## Install
+
+Download the latest `Nexview-<version>.zip` from
+[Releases](https://github.com/J0n4e/nexview_mac/releases), unzip it and move **Nexview** to
+Applications. The app is signed ad hoc, so the first time you open it, right-click it and choose
+**Open**. Then enter the address of your Nexview server and sign in.
+
 ## Build
 
 Requirements: an Apple Silicon Mac with the Xcode command line tools (`xcode-select --install`).
