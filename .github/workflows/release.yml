@@ -47,7 +47,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.value }}
         run: |
-          cat > notes.md <<NOTES
+          # What changed: the "## $VERSION" section of macos/CHANGELOG.md.
+          awk -v v="## $VERSION" '$0 == v {on=1; next} on && /^## / {exit} on' macos/CHANGELOG.md > changes.md
+          cat changes.md > notes.md
+          [[ -s changes.md ]] && echo >> notes.md
+          cat >> notes.md <<NOTES
           Nexview for Mac $VERSION for Apple Silicon Macs (macOS 14 Sonoma or newer).
 
           **Install:** download \`Nexview-$VERSION.zip\`, unzip it and move **Nexview** to Applications.

@@ -35,6 +35,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         if serverURL == nil { askForServer(firstRun: true) } else { loadServer() }
         startPolling()
         watchForClears()
+        Updater.shared.mainWindowVisible = { [weak self] in self?.window.isVisible == true }
+        Updater.shared.start()
     }
 
     func buildWindow() {
@@ -216,6 +218,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             m.addItem(.separator())
             m.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
             m.addItem(withTitle: "About Nexview", action: #selector(showAbout), keyEquivalent: "")
+            m.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
             m.addItem(.separator())
             m.addItem(withTitle: "Quit Nexview", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
             m.items.forEach { if $0.action != #selector(NSApplication.terminate(_:)) { $0.target = self } }
@@ -529,6 +532,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     func userNotificationCenter(_ c: UNUserNotificationCenter, didReceive r: UNNotificationResponse, withCompletionHandler done: @escaping () -> Void) {
         let info = r.notification.request.content.userInfo
+        if info["update"] != nil {
+            if r.actionIdentifier != UNNotificationDismissActionIdentifier { Updater.shared.showPending() }
+            done(); return
+        }
         if let srv = info["server"] as? String, let id = info["id"] as? Int { markRead(server: srv, id: id) }
         if r.actionIdentifier == UNNotificationDismissActionIdentifier { done(); return }   // cleared in macOS: just mark read
         if let srv = info["server"] as? String, let i = store.servers.firstIndex(where: { $0.url == srv }), i != store.selected { selectServer(i) }
@@ -647,7 +654,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         func mi(_ t: String, _ s: Selector?, _ k: String, _ mods: NSEvent.ModifierFlags = .command) -> NSMenuItem {
             let i = NSMenuItem(title: t, action: s, keyEquivalent: k); i.keyEquivalentModifierMask = mods; return i
         }
-        add("Nexview", [mi("About Nexview", #selector(showAbout), ""), .separator(),
+        add("Nexview", [mi("About Nexview", #selector(showAbout), ""), mi("Check for Updates…", #selector(checkForUpdates), ""), .separator(),
                         mi("Settings…", #selector(showSettings), ","), .separator(),
                         mi("Open in Browser", #selector(openBrowser), ""), .separator(),
                         mi("Hide Nexview", #selector(NSApplication.hide(_:)), "h"), .separator(),
@@ -669,6 +676,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     @objc func zoomReset() { webView.pageZoom = 1 }
     @objc func showSettings() { PanelWindows.showSettings() }
     @objc func showAbout() { PanelWindows.showAbout() }
+    @objc func checkForUpdates() { Updater.shared.checkNow() }
     @objc func openBrowser() { if let u = webView.url ?? serverURL { NSWorkspace.shared.open(u) } }
 }
 
