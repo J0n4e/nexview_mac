@@ -2,6 +2,32 @@
 
 What changed in each version of Nexview for Mac. The release on GitHub and the update window show the section for that version.
 
+## 0.1.3
+
+### New
+- **Signed updates.** Every release is signed, and the app checks the signature before installing an update. An unsigned or altered download is refused, and the installed app stays as it was.
+- A warning appears when a server is added with plain `http://` and isn't on your local network, because passwords would travel unencrypted.
+
+### Changed
+- Addresses typed without `http://` or `https://` now default to `https://`.
+- Saved sign-ins and the app's connection to the page only work for the exact server address, including `http` vs `https` and the port.
+- Links that open outside the app are limited to web and mail links.
+- **Open at Login** is now off by default for new installs.
+- Updates are only downloaded from this project's GitHub releases.
+
+### Fixed
+- Notifications that arrived while the app was in front are no longer marked read on the server at the next launch.
+- Notifications and the Dock badge come back by themselves after the server rejects the app's key, instead of needing a reload.
+- Clearing a notification no longer sometimes marks others read, and reads are no longer sent to the server several times.
+- A manual update check no longer says "You're up to date" when the release's download is missing.
+- The update window no longer gets replaced while an update is downloading, and temporary update files are cleaned up.
+- The error page shows server addresses and error text safely.
+
+### Build
+- Built from a pinned version of Nexview, so the same version always builds the same app.
+- Tests run on every change and before each release. The release workflow uses pinned actions and minimal permissions.
+- The build number is now a plain number.
+
 ## 0.1.2
 
 ### New
