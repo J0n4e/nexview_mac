@@ -104,11 +104,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     func normalise(_ raw: String) -> URL? {
         var t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.isEmpty { return nil }
-        if !t.contains("://") { t = "http://" + t }
+        if !t.contains("://") { t = "https://" + t }
         if !t.hasSuffix("/") { t += "/" }
         guard let u = URL(string: t), u.host != nil else { return nil }
         return u
     }
+
+    /// Plain http:// to a host that is not on this Mac or the local network: passwords travel unencrypted.
+    static func isInsecureRemote(_ u: URL) -> Bool {
+        guard u.scheme?.lowercased() == "http", var h = u.host?.lowercased() else { return false }
+        if h.hasPrefix("[") && h.hasSuffix("]") { h = String(h.dropFirst().dropLast()) }
+        if h == "localhost" || h == "::1" || h.hasSuffix(".local") || h.hasPrefix("127.") || h.hasPrefix("10.") || h.hasPrefix("192.168.") { return false }
+        let o = h.split(separator: ".")
+        if o.count == 4, o[0] == "172", let b = Int(o[1]), (16...31).contains(b) { return false }
+        return true
+    }
+    static let insecureWarning = "This address uses http:// over the internet: your password and session travel unencrypted. Use https:// if your server supports it."
 
     @objc func changeServer() { askForServer(firstRun: false) }
     @objc func addServer() { askForServer(firstRun: false, adding: true) }
@@ -150,6 +161,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                     let srv = Server(name: label, url: u.absoluteString)
                     if editing { self.store.replaceCurrent(srv) } else { self.store.add(srv) }
                     self.loadServer()
+                    if Self.isInsecureRemote(u) {
+                        let w = NSAlert(); w.alertStyle = .warning; w.messageText = "Unencrypted connection"
+                        w.informativeText = Self.insecureWarning; w.runModal()
+                    }
                 }
                 else { self.askForServer(firstRun: firstRun, adding: adding, error: "No Nexview server answered at \(u.absoluteString)" + (err.map { " (\($0.localizedDescription))" } ?? "") + ".", name: nf.stringValue, address: tf.stringValue) }
             }
@@ -162,10 +177,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         let html = """
         <html><body style="font:15px -apple-system;background:#141019;color:#ddd;display:flex;flex-direction:column;height:100vh;align-items:center;justify-content:center;gap:12px">
         <div style="font-size:20px;color:#ff3b4e">Can't reach your Nexview server</div>
-        <div style="color:#999">\(serverURL?.absoluteString ?? "") — \(e.localizedDescription)</div>
+        <div style="color:#999">\(Self.html(serverURL?.absoluteString ?? "")) — \(Self.html(e.localizedDescription))</div>
         <div style="color:#777">Use View → Reload (⌘R) to retry, or check the address in Nexview → Settings…</div></body></html>
         """
         wv.loadHTMLString(html, baseURL: nil)
+    }
+
+    static func html(_ s: String) -> String {
+        s.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
+         .replacingOccurrences(of: ">", with: "&gt;").replacingOccurrences(of: "\"", with: "&quot;")
+         .replacingOccurrences(of: "'", with: "&#39;")
     }
 
     // With "Run in background" on, closing the window keeps Nexview running so notifications still arrive.
@@ -309,10 +330,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             keyRequested.remove(srv.url)
             pollAll()
         case "alive":
+            if let srv = store.current, store.apiKeys?[srv.url] == nil, keyLost.remove(srv.url) != nil {
+                // The key was dropped after a 401: ask the page to report its session again so a new one is made.
+                webView.evaluateJavaScript("window.__nexviewMacResetSession && window.__nexviewMacResetSession()", completionHandler: nil)
+            }
             flushReads()
         case "marked":
             guard let srv = store.current, let ids = m["ids"] as? [Int] else { break }
             var q = pendingReads; q[srv.url] = (q[srv.url] ?? []).filter { !ids.contains($0) }; pendingReads = q
+            readsInFlight.remove(srv.url)
             scheduleQuickPoll(srv)
         case "refresh":
             if let srv = store.current { scheduleQuickPoll(srv) }
@@ -338,6 +364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     var pollTimer: Timer?
     var counts: [String: Int] = [:]          // server URL -> unread notifications + requests awaiting approval
     var keyRequested: Set<String> = []
+    var keyLost: Set<String> = []           // servers whose key was dropped after a 401
     var quickPoll: DispatchWorkItem?
 
     func startPolling() {
@@ -388,7 +415,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             let unread = await get(srv, key, "api/v1/notifications/unread/count")
             if unread.status == 401 {
                 // Key revoked or expired: forget it; a new one is made the next time this account is open.
-                store.apiKeys?[srv.url] = nil; store.save()
+                store.apiKeys?[srv.url] = nil; store.save(); keyLost.insert(srv.url)
                 counts[srv.url] = nil; updateBadge(); return
             }
             guard unread.status == 200 else { return }       // server unreachable: keep the last known count
@@ -402,6 +429,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             guard list.status == 200, let items = list.json as? [[String: Any]] else { return }
             let ids = items.compactMap { $0["id"] as? Int }
             removeDelivered(server: srv.url, keeping: Set(ids))
+            pruneShown(server: srv.url, unread: Set(ids))
             let tag = Credentials.tag(srv.url, key.user)
             var seen = UserDefaults.standard.dictionary(forKey: "LastNotified") as? [String: Int] ?? [:]
             let maxID = ids.max() ?? 0
@@ -428,22 +456,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 guard info["server"] as? String == server, let id = info["id"] as? Int else { return false }
                 return !unread.contains(id)
             }.map(\.request.identifier)
-            if !gone.isEmpty {
-                DispatchQueue.main.async { self.shown.subtract(gone) }
+            guard !gone.isEmpty else { return }
+            // Forget them first, so watchForClears never sees them vanish and takes it for a user clear.
+            DispatchQueue.main.async {
+                self.shown.subtract(gone)
+                self.seenDelivered.subtract(gone)
                 center.removeDeliveredNotifications(withIdentifiers: gone)
             }
         }
     }
 
     /// Notifications this app put into Notification Center and has not removed itself.
+    /// Kept in insertion order and capped, so it cannot grow without bound.
+    static let shownLimit = 500
+    var shownList: [String] {
+        get { UserDefaults.standard.stringArray(forKey: "ShownNotifications") ?? [] }
+        set { UserDefaults.standard.set(Array(newValue.suffix(Self.shownLimit)), forKey: "ShownNotifications") }
+    }
     var shown: Set<String> {
-        get { Set(UserDefaults.standard.stringArray(forKey: "ShownNotifications") ?? []) }
-        set { UserDefaults.standard.set(Array(newValue), forKey: "ShownNotifications") }
+        get { Set(shownList) }
+        set { shownList = shownList.filter { newValue.contains($0) } }
+    }
+    func addShown(_ ident: String) { var l = shownList.filter { $0 != ident }; l.append(ident); shownList = l }
+
+    /// Drop entries for this server that are no longer unread there (read elsewhere or deleted).
+    func pruneShown(server: String, unread: Set<Int>) {
+        let prefix = "nexview-\(server)-"
+        let keep = shownList.filter { ident in
+            guard ident.hasPrefix(prefix), let id = Int(ident.dropFirst(prefix.count)) else { return true }
+            return unread.contains(id)
+        }
+        if keep.count != shownList.count { shownList = keep; seenDelivered.formIntersection(Set(keep)) }
     }
     var clearTimer: Timer?
     /// Ours that Notification Center has actually listed. Only these can count as cleared: a fresh one
     /// may not be listed yet, and one held back while Nexview is in front is never listed at all.
-    lazy var seenDelivered: Set<String> = shown
+    /// Starts empty: an entry joins only once Notification Center really lists it.
+    var seenDelivered: Set<String> = []
 
     /// macOS does not reliably tell an app when its notifications are cleared from Notification Center,
     /// so look every few seconds: any of ours that vanished without us removing it was cleared by the user.
@@ -487,9 +536,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         flushReads()
     }
 
+    /// Servers with a mark-read send under way; cleared on "marked" or after 30 s.
+    var readsInFlight: Set<String> = []
+
     func flushReads() {
-        guard let srv = store.current, let ids = pendingReads[srv.url], !ids.isEmpty else { return }
+        guard let srv = store.current, let ids = pendingReads[srv.url], !ids.isEmpty, !readsInFlight.contains(srv.url) else { return }
+        readsInFlight.insert(srv.url)
         webView.evaluateJavaScript("window.__nexviewMacMarkRead && window.__nexviewMacMarkRead(\(ids))", completionHandler: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in self?.readsInFlight.remove(srv.url) }
     }
 
     func updateBadge() { setBadge(store.servers.reduce(0) { $0 + (counts[$1.url] ?? 0) }) }
@@ -519,15 +573,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         c.userInfo = ["server": server.url, "ziel": ziel ?? "", "id": id]
         c.categoryIdentifier = "nexview"           // with a dismiss action, so clearing it in macOS marks it read
         c.threadIdentifier = server.url
-        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "nexview-\(server.url)-\(id)", content: c, trigger: nil))
-        shown.insert("nexview-\(server.url)-\(id)")
+        // Recorded in `shown` only once willPresent lets it through (or it is delivered in the background).
+        let ident = "nexview-\(server.url)-\(id)"
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: ident, content: c, trigger: nil)) { err in
+            guard err == nil else { return }
+            DispatchQueue.main.async {
+                // In the background willPresent is not called; the notification goes straight to Notification Center.
+                if !(NSApp.isActive && self.window.isKeyWindow && server.url == self.store.current?.url) { self.addShown(ident) }
+            }
+        }
     }
 
     func userNotificationCenter(_ c: UNUserNotificationCenter, willPresent n: UNNotification,
                                 withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
         // Nexview in front showing that same server: its bell already shows it.
         let srv = n.request.content.userInfo["server"] as? String
-        done(NSApp.isActive && window.isKeyWindow && srv == store.current?.url ? [] : [.banner, .sound, .list])
+        let suppress = NSApp.isActive && window.isKeyWindow && srv == store.current?.url
+        // Only one that is really presented may later count as cleared by the user.
+        if !suppress, srv != nil { DispatchQueue.main.async { self.addShown(n.request.identifier) } }
+        done(suppress ? [] : [.banner, .sound, .list])
     }
 
     func userNotificationCenter(_ c: UNUserNotificationCenter, didReceive r: UNNotificationResponse, withCompletionHandler done: @escaping () -> Void) {
@@ -593,13 +657,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     // MARK: navigation – external links go to the default browser
     func isLocal(_ url: URL) -> Bool {
         guard let s = serverURL else { return false }
-        return url.host == s.host && url.port == s.port
+        func origin(_ u: URL) -> (String, String, Int)? {
+            guard let scheme = u.scheme?.lowercased(), let host = u.host?.lowercased() else { return nil }
+            let port = u.port ?? (scheme == "https" ? 443 : scheme == "http" ? 80 : -1)
+            return (scheme, host, port)
+        }
+        guard let a = origin(url), let b = origin(s) else { return false }
+        return a == b
     }
+
+    /// Only these are ever handed to another app.
+    static let externalSchemes: Set<String> = ["http", "https", "mailto"]
 
     func webView(_ wv: WKWebView, decidePolicyFor action: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         if action.shouldPerformDownload { decisionHandler(.download); return }
         if let u = action.request.url, ["http", "https"].contains(u.scheme ?? ""), !isLocal(u) {
-            NSWorkspace.shared.open(u); decisionHandler(.cancel); return
+            if Self.externalSchemes.contains(u.scheme?.lowercased() ?? "") { NSWorkspace.shared.open(u) }
+            decisionHandler(.cancel); return
         }
         decisionHandler(.allow)
     }
@@ -610,7 +684,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     func webView(_ wv: WKWebView, createWebViewWith c: WKWebViewConfiguration, for action: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         if let u = action.request.url {
-            if isLocal(u) { wv.load(action.request) } else { NSWorkspace.shared.open(u) }
+            if isLocal(u) { wv.load(action.request) }
+            else if Self.externalSchemes.contains(u.scheme?.lowercased() ?? "") { NSWorkspace.shared.open(u) }
         }
         return nil
     }
