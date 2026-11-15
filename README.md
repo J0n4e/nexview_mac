@@ -33,7 +33,7 @@ Around it, the app adds:
 1. Download the latest `Nexview-<version>.zip` from
    [Releases](https://github.com/J0n4e/nexview_mac/releases).
 2. Unzip it and move **Nexview** to Applications.
-3. The app is signed ad hoc (not with an Apple Developer ID), so the first time you open it,
+3. The app is signed with its own certificate, not an Apple Developer ID, so the first time you open it,
    right-click it in Finder, choose **Open** and confirm. After that it opens normally.
 4. Enter the address of your Nexview server and sign in with your Nexview account.
 
@@ -79,7 +79,8 @@ zsh macos/build.sh
 ```
 
 This fetches Nexview's code into `src/` (only its icon and version are used) and builds
-`build/Nexview.app`. Copy it to `/Applications` to install it. The first time you open it,
+`build/Nexview.app`. Local builds are signed ad hoc. To sign with a certificate from your
+keychain instead, set `CODESIGN_IDENTITY` to its SHA-1 (and optionally `CODESIGN_KEYCHAIN`). Copy it to `/Applications` to install it. The first time you open it,
 right-click it and choose **Open**, as above.
 
 The upstream Nexview code is pinned to the commit in `macos/UPSTREAM_REF` (a full 40-character
@@ -122,6 +123,15 @@ Besides the normal web interface, the app uses these server endpoints:
 On `main`, the Release workflow notices a version that has not been released yet. It runs the
 tests, builds the app, signs the zip with the `NEXVIEW_UPDATE_SIGNING_KEY` secret and publishes
 `Nexview-<version>.zip` and `Nexview-<version>.zip.sig` as release `v<version>`.
+
+CI and release builds are signed with a self-signed Nexview code-signing certificate (public
+copy in `macos/codesign.crt`, SHA-1 `ED08276C01EE6B11A38901579F29C987F50CDF47`), imported from
+the `NEXVIEW_CODESIGN_P12` and `NEXVIEW_CODESIGN_P12_PASSWORD` secrets into a temporary keychain.
+The designated requirement pins the bundle id and this certificate. It does not replace Apple
+notarization: the first install still needs right-click → **Open**. Its purpose is a stable
+identity, so the Keychain doesn't ask for access again after every update. The update from
+0.1.4 (signed ad hoc) to 0.1.5 may ask once more because the identity changes; after that it
+doesn't. The updater refuses updates that don't satisfy the running app's designated requirement.
 
 To verify a release by hand (needs OpenSSL 3; the `openssl` that ships with macOS is LibreSSL,
 so use `brew install openssl@3`):

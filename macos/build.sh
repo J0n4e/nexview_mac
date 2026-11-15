@@ -59,9 +59,26 @@ for s in 16 32 128 256 512; do
 done
 iconutil -c icns "$ICONSET" -o "$RES/Nexview.icns"
 
-echo "==> Signing (ad-hoc, hardened runtime)"
-codesign --force --options runtime --sign - "$APP/Contents/MacOS/Nexview"
-codesign --force --options runtime --sign - "$APP"
+# CODESIGN_IDENTITY (the certificate's SHA-1) signs with the stable Nexview certificate, so the
+# designated requirement, and with it the Keychain's access rules, stays the same across updates.
+# CODESIGN_KEYCHAIN optionally names the keychain that holds it. Unset: ad-hoc, for local builds.
+BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")
+SIGN=(--force --options runtime)
+if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
+  CERT_SHA1=$(print -r -- "$CODESIGN_IDENTITY" | LC_ALL=C tr -cd '0-9A-Fa-f' | tr 'A-F' 'a-f')
+  [[ ${#CERT_SHA1} -eq 40 ]] || { echo "CODESIGN_IDENTITY must be the certificate's 40-char SHA-1"; exit 1; }
+  echo "==> Signing (identity $CERT_SHA1, hardened runtime)"
+  SIGN+=(--timestamp=none --sign "$CERT_SHA1")
+  [[ -n "${CODESIGN_KEYCHAIN:-}" ]] && SIGN+=(--keychain "$CODESIGN_KEYCHAIN")
+  REQ="=designated => identifier \"$BUNDLE_ID\" and certificate leaf = H\"$CERT_SHA1\""
+  codesign "${SIGN[@]}" --identifier "$BUNDLE_ID" "$APP/Contents/MacOS/Nexview"
+  codesign "${SIGN[@]}" --requirements "$REQ" "$APP"
+else
+  echo "==> Signing (ad-hoc, hardened runtime)"
+  SIGN+=(--sign -)
+  codesign "${SIGN[@]}" "$APP/Contents/MacOS/Nexview"
+  codesign "${SIGN[@]}" "$APP"
+fi
 codesign --verify --strict "$APP"
 
 rm -rf "$OUT/Nexview.app"

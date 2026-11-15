@@ -62,9 +62,23 @@ jobs:
             "$RUNNER_TEMP/test-bin"
           done
 
+      - name: Import code-signing identity
+        if: steps.check.outputs.exists == 'false'
+        env:
+          P12_BASE64: ${{ secrets.NEXVIEW_CODESIGN_P12 }}
+          P12_PASSWORD: ${{ secrets.NEXVIEW_CODESIGN_P12_PASSWORD }}
+        run: |
+          [ -n "${P12_BASE64:-}" ] && [ -n "${P12_PASSWORD:-}" ] \
+            || { echo "::error::secrets NEXVIEW_CODESIGN_P12 / NEXVIEW_CODESIGN_P12_PASSWORD are not set"; exit 1; }
+          bash macos/ci-import-codesign.sh
+
       - name: Build
         if: steps.check.outputs.exists == 'false'
         run: zsh macos/build.sh
+
+      - name: Verify code signature
+        if: steps.check.outputs.exists == 'false'
+        run: bash macos/ci-verify-codesign.sh build/Nexview.app
 
       - name: Package
         if: steps.check.outputs.exists == 'false'
@@ -104,6 +118,10 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Remove temporary keychain
+        if: always() && env.CODESIGN_KEYCHAIN != ''
+        run: security delete-keychain "$CODESIGN_KEYCHAIN" || true
+
   publish:
     needs: build
     if: needs.build.outputs.exists == 'false'
@@ -132,7 +150,7 @@ jobs:
           Nexview for Mac $VERSION for Apple Silicon Macs (macOS 14 Sonoma or newer).
 
           **Install:** download \`Nexview-$VERSION.zip\`, unzip it and move **Nexview** to Applications.
-          The app is signed ad hoc, so the first time you open it, right-click it and choose **Open**.
+          The app is not notarized by Apple, so the first time you open it, right-click it and choose **Open**.
 
           Then enter the address of your Nexview server and sign in with your Nexview account.
           NOTES
