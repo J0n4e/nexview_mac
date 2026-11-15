@@ -22,6 +22,7 @@ enum AppInfo {
     static var sourceVersion: String { Bundle.main.infoDictionary?["NexviewSourceVersion"] as? String ?? "?" }
     static let repo = URL(string: "https://github.com/DerKezorm/nexview")!
     static let developer = URL(string: "https://github.com/DerKezorm")!
+    static let macRepo = URL(string: "https://github.com/J0n4e/nexview_mac")!
 }
 
 // MARK: model shared by both windows
@@ -594,14 +595,17 @@ struct AboutView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            VStack(spacing: 12) {
-                Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 112, height: 112)
-                    .shadow(color: NX.accent500.opacity(0.45), radius: 22, y: 6)
-                (Text("NEX").foregroundColor(NX.mist100) + Text("VIEW").foregroundColor(NX.accent400))
-                    .font(.system(size: 30, weight: .heavy))
-                Text("for Mac").font(.system(size: 13)).foregroundColor(NX.mist500)
+            // Icon and name on one line keeps the window compact.
+            HStack(spacing: 14) {
+                Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 72, height: 72)
+                    .shadow(color: NX.accent500.opacity(0.45), radius: 16, y: 4)
+                VStack(alignment: .leading, spacing: 2) {
+                    (Text("NEX").foregroundColor(NX.mist100) + Text("VIEW").foregroundColor(NX.accent400))
+                        .font(.system(size: 30, weight: .heavy))
+                    Text("for Mac").font(.system(size: 13)).foregroundColor(NX.mist500)
+                }
             }
-            .padding(.top, 36).padding(.bottom, 22)
+            .padding(.top, 34).padding(.bottom, 20)
 
             VStack(spacing: 0) {
                 infoRow("App version", AppInfo.appVersion)
@@ -626,6 +630,28 @@ struct AboutView: View {
                         Label("Nexview on GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
                     }.buttonStyle(NXButton(kind: .primary))
                     Button { NSWorkspace.shared.open(AppInfo.repo.appendingPathComponent("issues")) } label: {
+                        Label("Report an issue", systemImage: "exclamationmark.bubble")
+                    }.buttonStyle(NXButton())
+                }
+                .padding(.top, 6)
+            }
+            .padding(.horizontal, 34).padding(.top, 24)
+
+            // The Mac app itself, laid out exactly like the developer's section above.
+            VStack(spacing: 10) {
+                HStack(spacing: 7) {
+                    Image(systemName: "laptopcomputer").foregroundColor(NX.accent400)
+                    (Text("Nexview for Mac").foregroundColor(NX.mist100) + Text(".").foregroundColor(NX.accent500))
+                        .font(.system(size: 16, weight: .bold))
+                }
+                Text("The Mac version of Nexview. Found a bug or have an idea? Let us know on GitHub.")
+                    .multilineTextAlignment(.center).font(.system(size: 13)).foregroundColor(NX.mist500)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
+                    Button { NSWorkspace.shared.open(AppInfo.macRepo) } label: {
+                        Label("Mac app on GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
+                    }.buttonStyle(NXButton(kind: .primary))
+                    Button { NSWorkspace.shared.open(AppInfo.macRepo.appendingPathComponent("issues")) } label: {
                         Label("Report an issue", systemImage: "exclamationmark.bubble")
                     }.buttonStyle(NXButton())
                 }
