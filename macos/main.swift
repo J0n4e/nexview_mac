@@ -138,7 +138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             askForServer(firstRun: firstRun, adding: adding, error: "That is not a valid address.", name: nf.stringValue, address: tf.stringValue); return
         }
         // Check that a Nexview server answers before saving it.
-        var req = URLRequest(url: u.appendingPathComponent("api/health")); req.timeoutInterval = 8
+        var req = URLRequest(url: u.appendingPathComponent("api/v1/health")); req.timeoutInterval = 8
         URLSession.shared.dataTask(with: req) { data, resp, err in
             DispatchQueue.main.async {
                 let ok = (resp as? HTTPURLResponse)?.statusCode == 200 &&
@@ -382,14 +382,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     func poll(_ srv: Server, _ key: AccessKey) {
         Task { @MainActor in
-            let unread = await get(srv, key, "api/notifications/unread/count")
+            let unread = await get(srv, key, "api/v1/notifications/unread/count")
             if unread.status == 401 {
                 // Key revoked or expired: forget it; a new one is made the next time this account is open.
                 store.apiKeys?[srv.url] = nil; store.save()
                 counts[srv.url] = nil; updateBadge(); return
             }
             guard unread.status == 200 else { return }       // server unreachable: keep the last known count
-            let pending = await get(srv, key, "api/admin/requests/pending/count")   // 403 for non-approvers
+            let pending = await get(srv, key, "api/v1/admin/requests/pending/count")   // 403 for non-approvers
             let u = (unread.json as? [String: Any])?["unread"] as? Int ?? 0
             let p = pending.status == 200 ? ((pending.json as? [String: Any])?["pending"] as? Int ?? 0) : 0
             counts[srv.url] = u + p
@@ -438,6 +438,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         set { UserDefaults.standard.set(Array(newValue), forKey: "ShownNotifications") }
     }
     var clearTimer: Timer?
+    /// Ours that Notification Center has actually listed. Only these can count as cleared: a fresh one
+    /// may not be listed yet, and one held back while Nexview is in front is never listed at all.
+    lazy var seenDelivered: Set<String> = shown
 
     /// macOS does not reliably tell an app when its notifications are cleared from Notification Center,
     /// so look every few seconds: any of ours that vanished without us removing it was cleared by the user.
@@ -447,9 +450,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 let present = Set(delivered.map(\.request.identifier))
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    let cleared = self.shown.subtracting(present)
+                    let shown = self.shown
+                    self.seenDelivered.formUnion(present.intersection(shown))
+                    let cleared = shown.intersection(self.seenDelivered).subtracting(present)
                     guard !cleared.isEmpty else { return }
                     self.shown.subtract(cleared)
+                    self.seenDelivered.subtract(cleared)
                     for ident in cleared {
                         // "nexview-<server URL>-<id>"
                         guard let dash = ident.lastIndex(of: "-"), let id = Int(ident[ident.index(after: dash)...]) else { continue }
