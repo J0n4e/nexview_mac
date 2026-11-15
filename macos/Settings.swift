@@ -4,7 +4,7 @@ import SwiftUI
 import UserNotifications
 import WebKit
 
-// MARK: preferences (no secrets here; servers and access keys live in the macOS Keychain)
+// MARK: preferences (no secrets here; servers and access keys live in store.json, see Store.swift)
 
 enum Prefs {
     static let d = UserDefaults.standard
