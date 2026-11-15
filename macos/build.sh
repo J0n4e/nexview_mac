@@ -41,7 +41,7 @@ APP="$TMP/Nexview.app"; RES="$APP/Contents/Resources"
 mkdir -p "$APP/Contents/MacOS" "$RES"
 
 echo "==> Native shell"
-swiftc -O -target arm64-apple-macos14.0 -o "$APP/Contents/MacOS/Nexview" "$MAC/main.swift" "$MAC/Settings.swift" "$MAC/Updater.swift"
+swiftc -O -target arm64-apple-macos14.0 -o "$APP/Contents/MacOS/Nexview" "$MAC/main.swift" "$MAC/Settings.swift" "$MAC/Updater.swift" "$MAC/ServerURL.swift"
 cp "$MAC/bridge.js" "$RES/bridge.js"
 sed -e "s/__APPVERSION__/$APP_VERSION/g" -e "s/__VERSION__/$VERSION_NUM/g" -e "s/__BUILD__/$BUILD_NUM/g" "$MAC/Info.plist" > "$APP/Contents/Info.plist"
 

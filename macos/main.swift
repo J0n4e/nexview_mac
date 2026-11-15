@@ -24,9 +24,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         UserDefaults.standard.removeObject(forKey: "TouchIDDeclined")
         let loaded = StoreLoader.load()
         store = loaded.store
+        // Older builds could save the same server twice under spellings that differ only in case,
+        // default port or trailing slash; keep the first, so every address (and SwiftUI row id) is unique.
+        if store.removeDuplicates() { store.save() }
         // One-time move of a server saved in plain text by an earlier build.
         if let old = UserDefaults.standard.string(forKey: "ServerURL") {
-            if store.servers.isEmpty { store.add(Server(name: URL(string: old)?.host ?? "Server", url: old)) }
+            if store.servers.isEmpty { _ = store.add(Server(name: URL(string: old)?.host ?? "Server", url: old)) }
             UserDefaults.standard.removeObject(forKey: "ServerURL")
         }
         buildMenu()
@@ -106,18 +109,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         a.informativeText = "\(cur.url) will be removed from this Mac."
         a.addButton(withTitle: "Remove"); a.addButton(withTitle: "Cancel")
         guard a.runModal() == .alertFirstButtonReturn else { return }
-        store.removeCurrent()
-        if serverURL == nil { buildMenu(); askForServer(firstRun: true) } else { loadServer() }
+        removeServer(at: store.selected) { [weak self] in
+            guard let self else { return }
+            if self.serverURL == nil { self.buildMenu(); self.askForServer(firstRun: true) } else { self.loadServer() }
+        }
     }
 
     /// Normalises "192.168.1.10:8000" or "nexview.example.com" to a full URL.
-    func normalise(_ raw: String) -> URL? {
-        var t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if t.isEmpty { return nil }
-        if !t.contains("://") { t = "https://" + t }
-        if !t.hasSuffix("/") { t += "/" }
-        guard let u = URL(string: t), u.host != nil else { return nil }
-        return u
+    /// Scheme and host are lowercased and a default port is dropped (see ServerURL).
+    func normalise(_ raw: String) -> URL? { ServerURL.parse(raw) }
+
+    /// "Already added as “Home”." when another saved server uses this address (`except`: the one being edited).
+    func duplicateError(_ url: String, except: Int?) -> String? {
+        guard let i = ServerURL.duplicate(of: url, in: store.servers.map(\.url), except: except) else { return nil }
+        return "This address is already added as “\(store.servers[i].name)”."
     }
 
     /// Plain http:// to a host that is not on this Mac or the local network: passwords travel unencrypted.
@@ -160,6 +165,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         guard let u = normalise(tf.stringValue) else {
             askForServer(firstRun: firstRun, adding: adding, error: "That is not a valid address.", name: nf.stringValue, address: tf.stringValue); return
         }
+        if let dup = duplicateError(u.absoluteString, except: editing ? store.selected : nil) {
+            askForServer(firstRun: firstRun, adding: adding, error: dup, name: nf.stringValue, address: tf.stringValue); return
+        }
         // Check that a Nexview server answers before saving it.
         var req = URLRequest(url: u.appendingPathComponent("api/v1/health")); req.timeoutInterval = 8
         URLSession.shared.dataTask(with: req) { data, resp, err in
@@ -169,8 +177,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 let label = nf.stringValue.trimmingCharacters(in: .whitespaces).isEmpty ? (u.host ?? "Server") : nf.stringValue
                 if ok {
                     let srv = Server(name: label, url: u.absoluteString)
-                    if editing { self.store.replaceCurrent(srv) } else { self.store.add(srv) }
-                    self.loadServer()
+                    let err: String?
+                    if editing { err = self.editServer(at: self.store.selected, srv, then: { self.loadServer() }) }
+                    else { err = self.store.add(srv) ? nil : self.duplicateError(srv.url, except: nil) }
+                    if let err {
+                        self.askForServer(firstRun: firstRun, adding: adding, error: err, name: nf.stringValue, address: tf.stringValue); return
+                    }
+                    if !editing { self.loadServer() }
                     if Self.isInsecureRemote(u) {
                         let w = NSAlert(); w.alertStyle = .warning; w.messageText = "Unencrypted connection"
                         w.informativeText = Self.insecureWarning; w.runModal()
@@ -331,10 +344,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
               let origin = msg.frameInfo.request.url, isLocal(origin) else { return }
         switch type {
         case "session":
-            if let user = m["user"] as? String { ensureAccessKey(for: user) }
+            if let user = m["user"] as? String {
+                if let srv = store.current, let k = store.apiKeys?[srv.url], k.user == user { tellPageKeyId(k.id) }
+                flushKeyDeletions(for: user)
+                ensureAccessKey(for: user)
+            }
         case "apikey":
             guard let srv = store.current, let key = m["key"] as? String, let user = m["user"] as? String else { break }
             var keys = store.apiKeys ?? [:]
+            // Account switch: the previous account's key can't be deleted from this session; remember it
+            // and delete it the next time that account is signed in here.
+            if let old = keys[srv.url], old.user != user { queueKeyDeletion(server: srv.url, old) }
             keys[srv.url] = AccessKey(key: key, id: m["id"] as? Int ?? 0, user: user)
             store.apiKeys = keys; store.save()
             keyRequested.remove(srv.url)
@@ -353,8 +373,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         case "refresh":
             if let srv = store.current { scheduleQuickPoll(srv) }
         case "signedOut":
-            // Signed out: this account should no longer notify this Mac.
-            if let srv = store.current, store.apiKeys?[srv.url] != nil {
+            // Signed out: this account should no longer notify this Mac. bridge.js deletes the key on the
+            // server just before the logout request; if that did not work, it is deleted later.
+            if let srv = store.current, let k = store.apiKeys?[srv.url] {
+                if (m["deletedId"] as? Int) != k.id { queueKeyDeletion(server: srv.url, k); deleteKeyDirect(server: srv.url, k) }
                 store.apiKeys?[srv.url] = nil; store.save()
                 counts[srv.url] = nil; updateBadge()
             }
@@ -630,12 +652,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     // MARK: navigation – external links go to the default browser
     func isLocal(_ url: URL) -> Bool {
         guard let s = serverURL else { return false }
+        return Self.sameOrigin(url, s)
+    }
+
+    static func sameOrigin(_ x: URL, _ y: URL) -> Bool {
         func origin(_ u: URL) -> (String, String, Int)? {
             guard let scheme = u.scheme?.lowercased(), let host = u.host?.lowercased() else { return nil }
             let port = u.port ?? (scheme == "https" ? 443 : scheme == "http" ? 80 : -1)
             return (scheme, host, port)
         }
-        guard let a = origin(url), let b = origin(s) else { return false }
+        guard let a = origin(x), let b = origin(y) else { return false }
         return a == b
     }
 
@@ -728,6 +754,208 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     @objc func openBrowser() { if let u = webView.url ?? serverURL { NSWorkspace.shared.open(u) } }
 }
 
+// MARK: per-address state when a server is edited or removed, and deleting the app's keys on the server
+
+extension AppDelegate {
+    /// Keys still to be deleted on their server: server URL -> keys. Persisted, so a key whose delete
+    /// failed (offline, or a different account is signed in) is deleted on a later session.
+    static let keyDeletionsKey = "PendingKeyDeletions"
+    var pendingKeyDeletions: [String: [[String: Any]]] {
+        get { (UserDefaults.standard.dictionary(forKey: Self.keyDeletionsKey) as? [String: [[String: Any]]]) ?? [:] }
+        set { UserDefaults.standard.set(newValue.filter { !$0.value.isEmpty }, forKey: Self.keyDeletionsKey) }
+    }
+
+    func queueKeyDeletion(server: String, _ k: AccessKey) {
+        guard k.id > 0 else { return }
+        var q = pendingKeyDeletions
+        var l = (q[server] ?? []).filter { ($0["id"] as? Int) != k.id }
+        l.append(["id": k.id, "user": k.user])
+        q[server] = Array(l.suffix(20)); pendingKeyDeletions = q
+    }
+
+    func unqueueKeyDeletion(server: String, id: Int) {
+        var q = pendingKeyDeletions
+        q[server] = (q[server] ?? []).filter { ($0["id"] as? Int) != id }; pendingKeyDeletions = q
+    }
+
+    /// A session for `user` is open on the current page: delete that account's leftover keys through it.
+    func flushKeyDeletions(for user: String) {
+        guard let srv = store.current else { return }
+        let current = store.apiKeys?[srv.url]?.id
+        for e in pendingKeyDeletions[srv.url] ?? [] {
+            guard e["user"] as? String == user, let id = e["id"] as? Int, id != current else { continue }
+            deleteKeyViaPage(id) { [weak self] ok in if ok { self?.unqueueKeyDeletion(server: srv.url, id: id) } }
+        }
+    }
+
+    func tellPageKeyId(_ id: Int) {
+        guard id > 0 else { return }
+        webView.evaluateJavaScript("window.__nexviewMacSetKeyId && window.__nexviewMacSetKeyId(\(id))", completionHandler: nil)
+    }
+
+    /// True when the page on screen is the given server (same scheme, host and port).
+    func pageShows(_ server: String) -> Bool {
+        guard let p = webView?.url, let s = URL(string: server) else { return false }
+        return Self.sameOrigin(p, s)
+    }
+
+    /// Deletes a key with the signed-in page's session (DELETE /api/auth/me/schluessel/{id} in bridge.js).
+    /// Calls back with true once the server confirmed (or the key was already gone); false otherwise, at most after 6 s.
+    func deleteKeyViaPage(_ id: Int, done: @escaping (Bool) -> Void) {
+        guard id > 0, let wv = webView else { done(false); return }
+        var finished = false
+        let finish: (Bool) -> Void = { ok in if !finished { finished = true; done(ok) } }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { finish(false) }
+        wv.callAsyncJavaScript("return window.__nexviewMacDeleteKey ? await window.__nexviewMacDeleteKey(id) : false",
+                               arguments: ["id": id], in: nil, in: .page) { r in
+            DispatchQueue.main.async {
+                if case .success(let v) = r { finish((v as? Bool) ?? ((v as? NSNumber)?.boolValue ?? false)) } else { finish(false) }
+            }
+        }
+    }
+
+    /// Best effort without the page: ask the server with the key itself. A read-only key may not be
+    /// allowed to delete itself; then it simply stays queued.
+    func deleteKeyDirect(server: String, _ k: AccessKey, done: ((Bool) -> Void)? = nil) {
+        guard k.id > 0, let base = URL(string: server), let u = URL(string: "api/auth/me/schluessel/\(k.id)", relativeTo: base) else { done?(false); return }
+        var req = URLRequest(url: u); req.httpMethod = "DELETE"; req.timeoutInterval = 10
+        req.setValue("Bearer \(k.key)", forHTTPHeaderField: "Authorization")
+        URLSession.shared.dataTask(with: req) { _, resp, _ in
+            let st = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            let ok = (200..<300).contains(st) || st == 404
+            DispatchQueue.main.async {
+                if ok { self.unqueueKeyDeletion(server: server, id: k.id) }
+                done?(ok)
+            }
+        }.resume()
+    }
+
+    /// Deletes the key on its server: through the page if it shows that server, else directly; queued if neither worked.
+    func deleteKeyOnServer(server: String, _ k: AccessKey, then: @escaping () -> Void) {
+        queueKeyDeletion(server: server, k)
+        let direct = { self.deleteKeyDirect(server: server, k) { _ in then() } }
+        guard pageShows(server) else { direct(); return }
+        deleteKeyViaPage(k.id) { ok in
+            if ok { self.unqueueKeyDeletion(server: server, id: k.id); then() } else { direct() }
+        }
+    }
+
+    /// Edits server `i`. Returns an error message (duplicate address) or nil; `then` runs once done
+    /// (after the old key was deleted, if it had to be).
+    ///
+    /// Rule (ServerURL.sameInstance): same host and base path => same Nexview, so everything kept for the
+    /// old address (key, queued mark-reads, notification state) moves to the new one; a scheme or port
+    /// change keeps it. Otherwise it is another server: the old key belongs to the old server and is
+    /// deleted there (best effort) and forgotten, and the old per-address state is dropped.
+    @discardableResult
+    func editServer(at i: Int, _ srv: Server, then: @escaping () -> Void = {}) -> String? {
+        guard store.servers.indices.contains(i) else { return "This server no longer exists." }
+        if let dup = duplicateError(srv.url, except: i) { return dup }
+        let old = store.servers[i].url
+        let key = store.apiKeys?[old]
+        guard old != srv.url else { store.update(i, srv); then(); return nil }
+        let same = ServerURL.sameInstance(old, srv.url)
+        let wasShown = pageShows(old)
+        if same { moveState(from: old, to: srv.url, user: key?.user) } else { dropState(old, user: key?.user) }
+        guard store.update(i, srv) else { return duplicateError(srv.url, except: i) ?? "Could not save this server." }
+        if !same, let key {
+            // Delete through the old page while it is still loaded, then go on.
+            unqueueKeyDeletionsMove(from: old, to: nil)
+            if wasShown { deleteKeyViaPage(key.id) { ok in if !ok { self.deleteKeyDirect(server: old, key) }; then() } }
+            else { deleteKeyDirect(server: old, key); then() }
+        } else { then() }
+        return nil
+    }
+
+    /// Removes server `i` from this Mac, deleting its key on the server first when possible (best effort);
+    /// it is always forgotten locally.
+    func removeServer(at i: Int, then: @escaping () -> Void) {
+        guard store.servers.indices.contains(i) else { then(); return }
+        let url = store.servers[i].url
+        let key = store.apiKeys?[url]
+        let finish = {
+            self.dropState(url, user: key?.user)
+            self.unqueueKeyDeletionsMove(from: url, to: nil)
+            if let j = self.store.servers.firstIndex(where: { $0.url == url }) { self.store.remove(j) }
+            then()
+        }
+        guard let key else { finish(); return }
+        if pageShows(url) { deleteKeyViaPage(key.id) { ok in if !ok { self.deleteKeyDirect(server: url, key) }; finish() } }
+        else { deleteKeyDirect(server: url, key); finish() }
+    }
+
+    /// Every piece of state kept per server URL, moved to a new address of the same server.
+    func moveState(from old: String, to new: String, user: String?) {
+        var q = pendingReads
+        if let ids = q.removeValue(forKey: old) { q[new] = Array(Set((q[new] ?? []) + ids)).sorted() }
+        pendingReads = q
+        if let user {
+            var seen = UserDefaults.standard.dictionary(forKey: "LastNotified") as? [String: Int] ?? [:]
+            if let v = seen.removeValue(forKey: Self.notifyTag(old, user)) { seen[Self.notifyTag(new, user)] = v }
+            UserDefaults.standard.set(seen, forKey: "LastNotified")
+        }
+        let oldPrefix = "nexview-\(old)-", newPrefix = "nexview-\(new)-"
+        let moved: [String] = shownList.map { (s: String) -> String in s.hasPrefix(oldPrefix) ? newPrefix + String(s.dropFirst(oldPrefix.count)) : s }
+        let renamed = Set(shownList.filter { $0.hasPrefix(oldPrefix) })
+        shownList = moved
+        seenDelivered.subtract(renamed)
+        removeDeliveredFor(prefix: oldPrefix)
+        unqueueKeyDeletionsMove(from: old, to: new)
+        if readsInFlight.remove(old) != nil { readsInFlight.insert(new) }
+        if keyLost.remove(old) != nil { keyLost.insert(new) }
+        if keyRequested.remove(old) != nil { keyRequested.insert(new) }
+        if let c = counts.removeValue(forKey: old) { counts[new] = c }
+        SettingsModel.shared.health[old] = nil
+        updateBadge()
+    }
+
+    /// Forgets everything kept for a server URL (not its queued key deletions, see unqueueKeyDeletionsMove).
+    func dropState(_ url: String, user: String?) {
+        var q = pendingReads; q[url] = nil; pendingReads = q
+        if let user {
+            var seen = UserDefaults.standard.dictionary(forKey: "LastNotified") as? [String: Int] ?? [:]
+            seen[Self.notifyTag(url, user)] = nil
+            UserDefaults.standard.set(seen, forKey: "LastNotified")
+        }
+        let prefix = "nexview-\(url)-"
+        let gone = Set(shownList.filter { $0.hasPrefix(prefix) })
+        shownList = shownList.filter { !gone.contains($0) }
+        seenDelivered.subtract(gone)
+        removeDeliveredFor(prefix: prefix)
+        readsInFlight.remove(url); keyLost.remove(url); keyRequested.remove(url)
+        counts[url] = nil
+        SettingsModel.shared.health[url] = nil
+        updateBadge()
+    }
+
+    /// Takes this app's notifications for an old address out of Notification Center (they would point at it).
+    func removeDeliveredFor(prefix: String) {
+        let center = UNUserNotificationCenter.current()
+        center.getDeliveredNotifications { delivered in
+            let ids = delivered.map(\.request.identifier).filter { $0.hasPrefix(prefix) }
+            if !ids.isEmpty { center.removeDeliveredNotifications(withIdentifiers: ids) }
+        }
+    }
+
+    /// Moves (or with `to == nil` drops) the queue of keys still to delete for an address.
+    func unqueueKeyDeletionsMove(from old: String, to new: String?) {
+        var q = pendingKeyDeletions
+        guard let l = q.removeValue(forKey: old) else { return }
+        if let new { q[new] = (q[new] ?? []) + l }
+        pendingKeyDeletions = q
+    }
+
+    /// "Sign out everywhere": delete the current page's key through it, queue the rest, forget all.
+    func forgetAllKeys(then: @escaping () -> Void) {
+        let keys = store.apiKeys ?? [:]
+        for (url, k) in keys { queueKeyDeletion(server: url, k); deleteKeyDirect(server: url, k) }
+        let finish = { self.store.apiKeys = [:]; self.store.save(); self.counts = [:]; self.updateBadge(); then() }
+        if let cur = store.current, let k = keys[cur.url], pageShows(cur.url) {
+            deleteKeyViaPage(k.id) { ok in if ok { self.unqueueKeyDeletion(server: cur.url, id: k.id) }; finish() }
+        } else { finish() }
+    }
+}
+
 // MARK: server list and read-only keys, kept in the macOS Keychain (never in plain-text prefs)
 
 let storeLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "io.github.derkezorm.nexview.macos", category: "store")
@@ -752,13 +980,38 @@ struct ServerStore: Codable {
         if st != errSecSuccess { storeLog.error("Saving the store to the Keychain failed: \(KeychainStore.describe(st), privacy: .public)") }
     }
 
-    mutating func add(_ s: Server) {
-        if let i = servers.firstIndex(where: { $0.url == s.url }) { servers[i] = s; selected = i }
-        else { servers.append(s); selected = servers.count - 1 }
-        save()
+    /// Adds and selects a server. Refuses (returns false) an address another saved server already uses
+    /// (compared normalised: see ServerURL.key), so every entry and SwiftUI row id stays unique.
+    @discardableResult
+    mutating func add(_ s: Server) -> Bool {
+        guard ServerURL.duplicate(of: s.url, in: servers.map(\.url)) == nil else { return false }
+        servers.append(s); selected = servers.count - 1
+        save(); return true
     }
-    mutating func replaceCurrent(_ s: Server) { if current != nil { servers[selected] = s; save() } else { add(s) } }
-    mutating func update(_ i: Int, _ s: Server) { if servers.indices.contains(i) { servers[i] = s; save() } }
+    /// Store-only edits; per-address state is moved by AppDelegate.editServer, which should be used instead.
+    @discardableResult
+    mutating func replaceCurrent(_ s: Server) -> Bool { current != nil ? update(selected, s) : add(s) }
+    @discardableResult
+    mutating func update(_ i: Int, _ s: Server) -> Bool {
+        guard servers.indices.contains(i), ServerURL.duplicate(of: s.url, in: servers.map(\.url), except: i) == nil else { return false }
+        if servers[i].url != s.url, let k = apiKeys?[servers[i].url] {
+            apiKeys?[servers[i].url] = nil
+            if ServerURL.sameInstance(servers[i].url, s.url) { apiKeys?[s.url] = k }   // see ServerURL.sameInstance
+        }
+        servers[i] = s; save(); return true
+    }
+    /// Drops later entries whose address duplicates an earlier one. True if anything changed.
+    mutating func removeDuplicates() -> Bool {
+        let cur = current.map { ServerURL.key($0.url) }
+        var seen = Set<String>(), out: [Server] = []
+        for s in servers where seen.insert(ServerURL.key(s.url)).inserted { out.append(s) }
+        guard out.count != servers.count else { return false }
+        let kept = Set(out.map(\.url))
+        apiKeys = apiKeys?.filter { kept.contains($0.key) }
+        servers = out
+        selected = servers.firstIndex { ServerURL.key($0.url) == cur } ?? 0
+        return true
+    }
     mutating func remove(_ i: Int) {
         guard servers.indices.contains(i) else { return }
         apiKeys?[servers[i].url] = nil

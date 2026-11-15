@@ -65,18 +65,32 @@ final class SettingsModel: ObservableObject {
 
     func activate(_ i: Int) { app.selectServer(i); refresh() }
 
-    func save(_ srv: Server, at i: Int?) {
-        if let i { app.store.update(i, srv); if i == app.store.selected { app.loadServer() } }
-        else { app.store.add(srv); app.loadServer() }
-        app.buildMenu(); refresh(); check(srv.url)
+    /// Returns an error to show inline (e.g. the address is already used by another server), or nil when saved.
+    func save(_ srv: Server, at i: Int?) -> String? {
+        if let i {
+            let active = i == app.store.selected
+            if let err = app.editServer(at: i, srv, then: { [self] in
+                if active { app.loadServer() }
+                app.buildMenu(); refresh(); check(srv.url)
+            }) { return err }
+        } else {
+            guard app.store.add(srv) else { return app.duplicateError(srv.url, except: nil) ?? "This address is already added." }
+            app.loadServer(); app.buildMenu(); refresh(); check(srv.url)
+        }
+        return nil
     }
+
+    /// Error for an address that another server (not `except`) already uses.
+    func duplicateError(_ url: String, except: Int?) -> String? { app.duplicateError(url, except: except) }
 
     func remove(_ i: Int) {
         let wasActive = i == app.store.selected
-        app.store.remove(i)
-        if app.store.current == nil { app.webView.loadHTMLString("", baseURL: nil); app.window.title = "Nexview" }
-        else if wasActive { app.loadServer() }
-        app.buildMenu(); refresh()
+        // Deletes the key on the server first when this server is the page on screen (best effort).
+        app.removeServer(at: i) { [self] in
+            if app.store.current == nil { app.webView.loadHTMLString("", baseURL: nil); app.window.title = "Nexview" }
+            else if wasActive { app.loadServer() }
+            app.buildMenu(); refresh()
+        }
     }
 
     func move(_ from: IndexSet, _ to: Int) { app.store.move(from: from, to: to); app.buildMenu(); refresh() }
@@ -386,14 +400,21 @@ struct ServerEditor: View {
 
     init(index: Int?, server: Server) { self.index = index; _server = StateObject(wrappedValue: Box(server)) }
 
-    var normalised: URL? { (NSApp.delegate as? AppDelegate)?.normalise(server.v.url) }
+    var normalised: URL? { ServerURL.parse(server.v.url) }
+    var duplicate: String? { normalised.flatMap { SettingsModel.shared.duplicateError($0.absoluteString, except: index) } }
+    @StateObject private var saveError = Box<String?>(nil)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             header(index == nil ? "Add server" : "Edit server", "Your Nexview server, e.g. on Unraid")
             NXField(label: "Name", placeholder: "Home", text: $server.v.name)
             NXField(label: "Address", placeholder: "https://nexview.example.com", text: $server.v.url)
-                .onChange(of: server.v.url) { result.v = .unknown }
+                .onChange(of: server.v.url) { result.v = .unknown; saveError.v = nil }
+            if let err = duplicate ?? saveError.v {
+                Label(err, systemImage: "exclamationmark.circle.fill")
+                    .font(.system(size: 12, weight: .medium)).foregroundColor(NX.bad)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if let u = normalised, AppDelegate.isInsecureRemote(u) {
                 Label(AppDelegate.insecureWarning, systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 12, weight: .medium)).foregroundColor(NX.bad)
@@ -415,7 +436,7 @@ struct ServerEditor: View {
                 Button("Cancel") { dismiss() }.buttonStyle(NXButton()).keyboardShortcut(.cancelAction)
                 Button(index == nil ? "Add server" : "Save") { saveIfReachable() }
                     .buttonStyle(NXButton(kind: .primary)).keyboardShortcut(.defaultAction)
-                    .disabled(normalised == nil || result.v == .checking)
+                    .disabled(normalised == nil || duplicate != nil || result.v == .checking)
             }
             .padding(.top, 6)
         }
@@ -439,7 +460,9 @@ struct ServerEditor: View {
         test { ok in
             guard ok, let u = normalised else { return }
             let name = server.v.name.trimmingCharacters(in: .whitespaces)
-            SettingsModel.shared.save(Server(name: name.isEmpty ? (u.host ?? "Server") : name, url: u.absoluteString), at: index)
+            if let err = SettingsModel.shared.save(Server(name: name.isEmpty ? (u.host ?? "Server") : name, url: u.absoluteString), at: index) {
+                saveError.v = err; return
+            }
             dismiss()
         }
     }
@@ -521,11 +544,12 @@ struct GeneralPane: View {
                 }
                 Rectangle().fill(NX.ink700).frame(height: 1)
                 actionRow("Sign out everywhere in this app", "Removes all cookies and stored website data.", "Reset", .danger) {
-                    if let app = NSApp.delegate as? AppDelegate {
-                        app.store.apiKeys = [:]; app.store.save(); app.counts = [:]; app.updateBadge()
+                    let wipe = {
+                        WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
+                                                                modifiedSince: .distantPast) { (NSApp.delegate as? AppDelegate)?.loadServer() }
                     }
-                    WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
-                                                            modifiedSince: .distantPast) { (NSApp.delegate as? AppDelegate)?.loadServer() }
+                    // Delete the app's keys on the servers (the current one through the page, before its session goes).
+                    if let app = NSApp.delegate as? AppDelegate { app.forgetAllKeys(then: wipe) } else { wipe() }
                 }
             }
         }
