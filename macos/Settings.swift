@@ -8,12 +8,12 @@ import WebKit
 
 enum Prefs {
     static let d = UserDefaults.standard
-    static func bool(_ k: String) -> Bool { d.object(forKey: k) == nil ? true : d.bool(forKey: k) }
+    static func bool(_ k: String, default def: Bool = true) -> Bool { d.object(forKey: k) == nil ? def : d.bool(forKey: k) }
     static var notifications: Bool { bool("NotificationsEnabled") }
     static var sound: Bool { bool("NotificationSound") }
     static var badge: Bool { bool("DockBadge") }
     static var keepRunning: Bool { bool("KeepRunning") }
-    static var openAtLogin: Bool { bool("OpenAtLogin") }
+    static var openAtLogin: Bool { bool("OpenAtLogin", default: false) }
 }
 
 enum AppInfo {
@@ -400,6 +400,11 @@ struct ServerEditor: View {
             NXField(label: "Name", placeholder: "Home", text: $server.v.name)
             NXField(label: "Address", placeholder: "https://nexview.example.com", text: $server.v.url)
                 .onChange(of: server.v.url) { result.v = .unknown }
+            if let u = normalised, AppDelegate.isInsecureRemote(u) {
+                Label(AppDelegate.insecureWarning, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 12, weight: .medium)).foregroundColor(NX.bad)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             HStack(spacing: 10) {
                 Button("Test connection") { test() }.buttonStyle(NXButton()).disabled(normalised == nil)
                 switch result.v {
@@ -494,7 +499,7 @@ struct NotificationsPane: View {
     @AppStorage("NotificationSound") var sound = true
     @AppStorage("DockBadge") var badge = true
     @AppStorage("KeepRunning") var background = true
-    @AppStorage("OpenAtLogin") var openAtLogin = true
+    @AppStorage("OpenAtLogin") var openAtLogin = false
     @StateObject private var status = Box<UNAuthorizationStatus>(.notDetermined)
 
     var body: some View {

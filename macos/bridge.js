@@ -14,8 +14,7 @@
   const origFetch = window.fetch;
   window.fetch = async function (input, init) {
     try {
-      const h = init && init.headers;
-      const a = h && (h.Authorization || (typeof h.get === 'function' && h.get('Authorization')));
+      const a = new Headers((init && init.headers) || (input instanceof Request ? input.headers : undefined)).get('authorization');
       if (a) auth = a;
     } catch (e) {}
     const res = await origFetch.apply(this, arguments);
@@ -41,7 +40,8 @@
     let r = await call(path, opts);
     if (r.status === 401) {
       const f = await origFetch((apiBase || '') + '/api/auth/refresh', { method: 'POST', credentials: 'same-origin' });
-      if (f.ok) { auth = 'Bearer ' + (await f.json()).access_token; r = await call(path, opts); }
+      const t = f.ok ? (await f.json()).access_token : null;
+      if (t) { auth = 'Bearer ' + t; r = await call(path, opts); }
     }
     return r;
   };
@@ -55,6 +55,9 @@
       post({ type: 'session', user: me.username });
     } catch (e) { reported = false; }
   }
+
+  // Called by the app after its key was rejected (401): report the session again so a new key is made.
+  window.__nexviewMacResetSession = () => { reported = false; if (auth) reportSession(); };
 
   // Called by the app when it has no key for this account yet.
   window.__nexviewMacMakeKey = async (name) => {
